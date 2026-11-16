@@ -1836,6 +1836,7 @@ func serve() {
 	mux.HandleFunc("/sub/", s.handleSub)
 	mux.HandleFunc("/proxy/ws/", s.handleTunnel)
 	mux.HandleFunc("/api/subscriptions", s.authWrap(s.handleSubscriptions))
+	mux.HandleFunc("/api/subscription-links", s.authWrap(s.handleSubscriptionLinks))
 	mux.HandleFunc("/api/logs", s.authWrap(s.handleLogs))
 	mux.HandleFunc("/api/shutdown", s.authWrap(s.handleShutdown))
 	mux.HandleFunc("/api/host", s.authWrap(s.handlePublicHost))
@@ -2144,6 +2145,14 @@ details.howto img{display:block;width:100%;max-width:290px;border-radius:10px;
         <p id="sub-host-hint" class="muted" style="white-space:pre-wrap"></p>
         <div class="field"><label>Clash Verge 订阅链接</label><input id="sub-clash" readonly><div class="row"><button class="btn" id="sub-copy-clash">复制 Clash 链接</button><button class="btn" id="sub-import-clash">导入本机 Clash Verge</button></div></div>
         <div class="field"><label>Quantumult X 节点资源链接</label><input id="sub-qx" readonly><button class="btn" id="sub-copy-qx">复制 Quantumult X 链接</button></div>
+        <div class="field">
+          <label>已启动国家的单节点链接</label>
+          <div class="row"><button class="btn" id="sub-show-links">获取已启动节点链接</button><button class="btn" id="sub-copy-nodes" disabled>复制全部节点链接</button><button class="btn" id="sub-copy-node-qx" disabled>复制全部 QX 节点配置</button></div>
+          <p class="muted">只列出已启动且未在切换的国家。可逐个复制 URI，或复制 QX 原生配置到 Quantumult X 的节点编辑中。链接包含凭据；启动状态不代表手机连通性已验证。</p>
+          <div id="sub-node-links"></div>
+          <textarea id="sub-node-copy" readonly hidden aria-label="待复制的节点链接" style="width:100%;min-height:100px"></textarea>
+          <p id="sub-node-message" class="muted"></p>
+        </div>
         <p class="muted">Quantumult X：设置 → 节点 → 引用，添加上面的资源链接。隧道模式需要新版服务器，并允许同域名 /proxy/ws/ 路径的 WebSocket 转发。链接含访问令牌，请勿分享；修改面板密码会让旧链接及隧道凭据失效。SOCKS5 直连未加密。</p>
         <div id="sub-error" class="err"></div>
       </div>
@@ -2244,7 +2253,16 @@ details.howto img{display:block;width:100%;max-width:290px;border-radius:10px;
 </div>
 <script>
 var S=null, HOST='', REG=[], lastNodeKey='';
-var SUB=null, subSelected=[], subDirty=false, subHostDirty=false;
+var SUB=null, subSelected=[], subDirty=false, subHostDirty=false, subNodeLinks=[];
+function clearSubNodeLinks(){
+  subNodeLinks=[];setHTML('sub-node-links','');$('sub-copy-nodes').disabled=true;$('sub-copy-node-qx').disabled=true;
+  $('sub-node-copy').hidden=true;$('sub-node-copy').value='';setText('sub-node-message','');
+}
+async function copySubNodeText(text){
+  if(!text) return;
+  try{if(!navigator.clipboard) throw new Error('clipboard unavailable');await navigator.clipboard.writeText(text);setText('sub-node-message','已复制')}
+  catch(e){var box=$('sub-node-copy');box.hidden=false;box.value=text;box.focus();box.select();setText('sub-node-message','请手动复制已选中的内容')}
+}
 function paintSubCountries(){
   var names=REG.map(function(r){return r.name});
   subSelected.forEach(function(c){if(names.indexOf(c)<0) names.push(c)});
@@ -2467,8 +2485,8 @@ function bindPush(id, endpoint, label, confirmText){
 function on(id, ev, fn){ var e=$(id); if(e) e.addEventListener(ev, fn); }
 
 on('sub-countries','change',function(){subDirty=true;subSelected=Array.from(this.querySelectorAll('input:checked')).map(function(e){return e.value})});
-on('sub-host','input',function(){subHostDirty=true;updateSubLinks()});
-on('sub-transport','change',function(){try{localStorage.setItem('urnetdSubTransport',this.value)}catch(e){}updateSubLinks()});
+on('sub-host','input',function(){subHostDirty=true;clearSubNodeLinks();updateSubLinks()});
+on('sub-transport','change',function(){try{localStorage.setItem('urnetdSubTransport',this.value)}catch(e){}clearSubNodeLinks();updateSubLinks()});
 on('sub-save-host','click',async function(){
   var b=this;b.disabled=true;
   try{
@@ -2479,9 +2497,10 @@ on('sub-save-host','click',async function(){
     subHostDirty=false;HOST='';lastNodeKey='';await poll();await loadSubscriptions();setText('sub-error','节点地址已保存，请在客户端更新订阅');
   }catch(e){setText('sub-error',e.message)}finally{b.disabled=false}
 });
-on('sub-base','input',updateSubLinks);
+on('sub-base','input',function(){clearSubNodeLinks();updateSubLinks()});
 on('sub-reload','click',loadSubscriptions);
 on('sub-save','click',async function(){
+  clearSubNodeLinks();
   this.disabled=true;setText('sub-error','');
   try{var r=await post('/api/subscriptions',{countries:subSelected});if(r.error) throw new Error(r.error);subDirty=false;await loadSubscriptions()}
   catch(e){setText('sub-error',e.message)}finally{this.disabled=false}
@@ -2493,6 +2512,22 @@ async function copySubscription(format){
 }
 on('sub-copy-clash','click',function(){copySubscription('clash')});
 on('sub-copy-qx','click',function(){copySubscription('qx')});
+on('sub-show-links','click',async function(){
+  var b=this;b.disabled=true;clearSubNodeLinks();
+  try{
+    updateSubLinks();if(!$('sub-qx').value) return;
+    var url=new URL($('sub-qx').value),params=new URLSearchParams(url.search);
+    var r=await get('/api/subscription-links?'+params.toString());if(r.error) throw new Error(r.error);
+    if(!Array.isArray(r.nodes)) throw new Error('无法获取节点链接，请检查连接地址和服务器版本');
+    subNodeLinks=r.nodes;
+    setHTML('sub-node-links',subNodeLinks.map(function(n,i){return '<div class="field"><label>'+esc(n.country)+'</label><input readonly aria-label="'+esc(n.country)+' 节点链接" value="'+esc(n.uri)+'"><div class="row"><button class="btn" data-node="'+i+'" data-kind="uri">复制节点链接</button><button class="btn" data-node="'+i+'" data-kind="qx">复制 QX 配置</button></div></div>'}).join(''));
+    $('sub-copy-nodes').disabled=!subNodeLinks.length;$('sub-copy-node-qx').disabled=!subNodeLinks.length;
+    setText('sub-node-message',subNodeLinks.length?'已获取 '+subNodeLinks.length+' 个已启动节点；状态变化后请重新获取。':'暂无已启动节点，请先保存国家并等待启动完成。');
+  }catch(e){setText('sub-node-message',e.message)}finally{b.disabled=false}
+});
+on('sub-node-links','click',function(e){var b=e.target.closest('button[data-node]');if(!b) return;var n=subNodeLinks[Number(b.getAttribute('data-node'))];if(n) copySubNodeText(n[b.getAttribute('data-kind')])});
+on('sub-copy-nodes','click',function(){copySubNodeText(subNodeLinks.map(function(n){return n.uri}).join('\n'))});
+on('sub-copy-node-qx','click',function(){copySubNodeText(subNodeLinks.map(function(n){return n.qx}).join('\n'))});
 on('sub-import-clash','click',function(){if($('sub-clash').value) location.href='clash://install-config?url='+encodeURIComponent($('sub-clash').value)+'&name=URnetwork'});
 setInterval(function(){if($('view-regions').classList.contains('on')) loadSubscriptions()},5000);
 

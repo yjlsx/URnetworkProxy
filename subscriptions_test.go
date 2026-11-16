@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -242,5 +243,49 @@ func TestSubscriptionStatusDoesNotLeakPassword(t *testing.T) {
 	node := result["nodes"].([]any)[0].(map[string]any)
 	if node["running"] != true || node["probeError"] != "upstream timed out" || node["exitIP"] != "" {
 		t.Fatal("process status must preserve failed upstream probe")
+	}
+}
+
+func TestExportRunningNodeLinks(t *testing.T) {
+	testSubscriptionConfig(t)
+	old := subscriptions
+	active, stopped, busy := NewServer(), NewServer(), NewServer()
+	active.running = true
+	busy.running, busy.busy = true, true
+	subscriptions = &subscriptionManager{
+		nodes:   []subscriptionNode{{"Japan", 10000}, {"Germany", 10001}, {"Singapore", 10002}},
+		workers: map[string]*Server{"Japan": active, "Germany": stopped, "Singapore": busy},
+	}
+	t.Cleanup(func() { subscriptions = old })
+	for _, query := range []string{"transport=wss&base=https%3A%2F%2Fpanel.example.com", "host=2001:db8::1"} {
+		rr := httptest.NewRecorder()
+		NewServer().handleSubscriptionLinks(rr, httptest.NewRequest("GET", "/api/subscription-links?"+query, nil))
+		var result struct {
+			Nodes []struct{ Country, URI, QX string }
+		}
+		if err := json.Unmarshal(rr.Body.Bytes(), &result); err != nil || rr.Code != 200 {
+			t.Fatalf("%d %s %v", rr.Code, rr.Body.String(), err)
+		}
+		if len(result.Nodes) != 1 || result.Nodes[0].Country != "Japan" {
+			t.Fatal("exported stopped or busy nodes")
+		}
+		n := result.Nodes[0]
+		u, err := url.Parse(n.URI)
+		if err != nil || u.Fragment != "URnetwork-Japan" {
+			t.Fatalf("invalid URI: %s", n.URI)
+		}
+		if strings.Contains(query, "wss") {
+			if u.Scheme != "trojan" || u.Host != "panel.example.com:443" || u.User.Username() != tunnelPassword("Japan") || u.Query().Get("path") != "/proxy/ws/10000" || !strings.Contains(n.QX, "obfs=wss") {
+				t.Fatal("incorrect tunnel URI or QX configuration")
+			}
+		} else if u.Scheme != "socks5" || u.Host != "[2001:db8::1]:10000" || !strings.Contains(n.QX, "socks5=[2001:db8::1]:10000") {
+			t.Fatal("incorrect direct URI")
+		}
+	}
+	active.running = false
+	rr := httptest.NewRecorder()
+	NewServer().handleSubscriptionLinks(rr, httptest.NewRequest("GET", "/api/subscription-links", nil))
+	if strings.TrimSpace(rr.Body.String()) != `{"nodes":[]}` {
+		t.Fatal("expected empty list when no nodes are active")
 	}
 }

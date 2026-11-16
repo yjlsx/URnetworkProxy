@@ -4,6 +4,8 @@
 
 本分支 `feat/multi-country-subscriptions` 增加了独立于原有单国家入口的多国家订阅。
 
+在「地区 → 多国家订阅」点击「获取已启动节点链接」，可逐个复制各国家的单节点 URI，也可复制全部已启动节点。HTTPS 隧道模式导出 `trojan://`，直连模式导出 `socks5://`；Quantumult X 可使用「复制 QX 配置」获得原生节点配置。仅导出当前运行且未切换的国家，不包含只勾选但未启动的国家。节点链接包含凭据，请妥善保管；单节点链接不会随国家增删自动更新，需要时重新获取。
+
 ### 无公网 IP：HTTPS 隧道模式
 
 新版增加 Trojan over WebSocket TLS 入口，Quantumult X 和 Clash/mihomo 可通过面板的 HTTPS 域名连接所选国家。客户端不需要连接服务器的 `10000–10007` 端口；这些 SOCKS5 端口只需服务器内部可达。

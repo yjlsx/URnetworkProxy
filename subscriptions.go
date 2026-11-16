@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -28,6 +29,60 @@ type subscriptionManager struct {
 }
 
 var subscriptions = &subscriptionManager{workers: make(map[string]*Server)}
+
+// Export a snapshot of running workers, not merely the checked/saved countries.
+func (s *Server) handleSubscriptionLinks(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	nodes := subscriptions.snapshot()
+	var running []subscriptionNode
+	subscriptions.mu.Lock()
+	for _, n := range nodes {
+		if worker := subscriptions.workers[n.Country]; worker != nil {
+			worker.mu.Lock()
+			active := worker.running && !worker.busy && !worker.retired
+			worker.mu.Unlock()
+			if active {
+				running = append(running, n)
+			}
+		}
+	}
+	subscriptions.mu.Unlock()
+	links := make([]map[string]string, 0, len(running))
+	for _, n := range running {
+		var uri, qx string
+		var err error
+		if r.URL.Query().Get("transport") == "wss" {
+			base := r.URL.Query().Get("base")
+			qx, err = renderTunnelSubscription("qx", base, []subscriptionNode{n})
+			if err == nil {
+				u, _ := url.Parse(base)
+				port := u.Port()
+				if port == "" {
+					port = "443"
+				}
+				query := url.Values{"security": {"tls"}, "type": {"ws"}, "sni": {u.Hostname()}, "host": {u.Hostname()}, "path": {tunnelPath(n.Port)}}
+				uri = (&url.URL{Scheme: "trojan", User: url.User(tunnelPassword(n.Country)), Host: net.JoinHostPort(u.Hostname(), port), RawQuery: query.Encode(), Fragment: "URnetwork-" + n.Country}).String()
+			}
+		} else {
+			host := nodeHostFrom(r.URL.Query().Get("host"))
+			qx, err = renderSubscription("qx", host, []subscriptionNode{n}, socksUser, socksPassword())
+			if err == nil {
+				uri = (&url.URL{Scheme: "socks5", User: url.UserPassword(socksUser, socksPassword()), Host: net.JoinHostPort(host, strconv.Itoa(n.Port)), Fragment: "URnetwork-" + n.Country}).String()
+			}
+		}
+		if err != nil {
+			http.Error(w, "无法生成节点链接："+err.Error(), http.StatusBadRequest)
+			return
+		}
+		links = append(links, map[string]string{"country": n.Country, "uri": uri, "qx": strings.TrimSpace(qx)})
+	}
+	json.NewEncoder(w).Encode(map[string]any{"nodes": links})
+}
 
 func subscriptionFile() string { return filepath.Join(filepath.Dir(confFile), "subscriptions.json") }
 
