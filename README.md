@@ -1,5 +1,42 @@
 # URnetwork 面板（urnetd）
 
+## 多国家订阅分支
+
+本分支 `feat/multi-country-subscriptions` 增加了独立于原有单国家入口的多国家订阅。
+
+1. 登录面板并完成 URnetwork 授权，进入「节点 → 多国家订阅」。
+2. 勾选国家并点击「保存国家并启动」。建议先选 2–3 个，最多 8 个。每个国家启动独立的 `socksproxy` 进程，端口从 `10000` 开始分配；增加或调整国家顺序不会改变保留国家的端口。原有单国家入口仍使用 `9999`。
+3. 填写客户端能访问的「节点地址」和「订阅服务地址」。节点地址不带端口；订阅服务地址示例：`https://panel.example.com` 或 `http://[2001:db8::1]:8877`。IPv6 节点地址填写 `2001:db8::1`，不加方括号。手机访问时请使用服务器或局域网地址。
+4. Clash Verge：复制 Clash 链接到订阅页面导入 URL，或点击「导入本机 Clash Verge」。配置内有一个 `URnetwork` 选择组，包含所选国家，默认规则为 `MATCH,URnetwork`；自定义分流请在客户端配置。
+5. Quantumult X：设置 → 节点 → 引用，添加 Quantumult X 链接。返回的是原生 SOCKS5 节点资源，不需要资源解析器；分流规则继续使用自己的 QX 配置。
+6. 保存后查看每个国家的启动状态与错误；启动为异步操作，链接生成不代表上游连通成功。国家增删后在客户端更新订阅。
+
+两个订阅使用同一组国家，格式分别为：
+
+```text
+/sub/<令牌>.yaml?host=<节点地址>  # Clash Verge / mihomo
+/sub/<令牌>.conf?host=<节点地址>  # Quantumult X 节点资源
+```
+
+国家和端口保存在配置目录的 `subscriptions.json`，重启后恢复。设置面板密码后才能拉取订阅；改密码会使旧订阅链接失效。订阅 GET 请求只生成配置，不启动进程。删除全部国家会停止订阅进程；为兼容旧链接，此时 Clash URL 回退到原有单节点订阅，QX URL 提示尚未选择国家。
+
+部署要求与限制：
+
+- 面板和各国家端口需要能从客户端到达。支持 IPv6 节点地址；要让代理监听 IPv6，可设置 `URNET_BIND_HOST=::`，面板设置 `URNETD_LISTEN=[::]:8877`。IPv4 双栈行为依赖操作系统，IPv4-only 客户端仍需中转或 VPN。
+- 订阅网页的 HTTPS/CDN 只解决订阅下载，不会转发 SOCKS5 节点流量。代理为普通 SOCKS5，用户名密码不提供传输加密，远程使用请放在 WireGuard 等安全网络内。可以用 `URNET_BIND_HOST` 绑定 VPN 地址。
+- 新的多国家订阅默认关闭 UDP 宣告；当前没有完成 UDP 端到端验证。TCP 网页代理与 UDP 应分别验收。
+- 同一 URnetwork 账号运行多个实例可能遇到 `429` 限流，国家也可能没有可用出口；每个国家增加一个进程及其内存开销。国家名称是上游选择条件，不保证固定 IP 或持续可用。
+- 本分支测试覆盖订阅格式、IPv6、令牌与密码轮换、端口稳定性、配置恢复和本地测试子进程的独立启停。2026-11-16 已运行新版面板获取两国 IPv6 订阅，并通过 Clash Verge 所带 mihomo 的 `-t` 配置校验；Windows amd64、Linux amd64/arm64 构建通过。真实 URnetwork 出口及 Clash Verge / Quantumult X 客户端导入仍需用实际账号与设备验收。
+
+从本分支构建面板需要 Go 1.27.3 或更高版本：
+
+```sh
+go test ./...
+go build -o urnetd .
+```
+
+将编译后的面板与上游对应操作系统和架构的 `socksproxy` 放在同一目录。上游 Release 中的 `urnetd` 不包含本分支新增功能。
+
 把 [URnetwork](https://ur.io/) 的去中心化出口桥接成本地 SOCKS5，并给你一个网页面板来切换地区、生成节点、导入 Shadowrocket。
 
 ![工作流](docs/img/flow.png)

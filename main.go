@@ -25,11 +25,13 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/skip2/go-qrcode"
@@ -190,7 +192,10 @@ type Region struct {
 }
 
 type Server struct {
-	opMu sync.Mutex // 串行化 start/stop/switch
+	opMu     sync.Mutex // 串行化 start/stop/switch
+	port     int        // 0 means the legacy single-country port
+	isolated bool       // subscription workers must not overwrite the primary country
+	retired  bool
 
 	mu       sync.Mutex
 	cmd      *exec.Cmd
@@ -218,6 +223,13 @@ type Server struct {
 
 func NewServer() *Server {
 	return &Server{logs: NewRing(400)}
+}
+
+func (s *Server) proxyPort() int {
+	if s.port != 0 {
+		return s.port
+	}
+	return proxyPort
 }
 
 type savedConf struct {
@@ -525,8 +537,14 @@ type ipInfo struct {
 	Country string `json:"country"`
 }
 
-func probeExit() (ipInfo, int64, error) {
-	proxyAddr := net.JoinHostPort("127.0.0.1", strconv.Itoa(proxyPort))
+func probeExit(port int) (ipInfo, int64, error) {
+	host := env("URNET_BIND_HOST", "0.0.0.0")
+	if host == "0.0.0.0" {
+		host = "127.0.0.1"
+	} else if host == "::" {
+		host = "::1"
+	}
+	proxyAddr := net.JoinHostPort(host, strconv.Itoa(port))
 	tr := &http.Transport{
 		DisableKeepAlives: true,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -582,6 +600,7 @@ func (s *Server) killExternal() {
 }
 
 func (s *Server) startLocked(country string) error {
+	port := s.proxyPort()
 	if _, err := os.Stat(binPath); err != nil {
 		return fmt.Errorf("找不到 socksproxy: %s%s\n把 socksproxy 放到 urnetd 旁边（同一目录），或用 URNET_BIN 指定", binPath, binSearchHint())
 	}
@@ -597,17 +616,13 @@ func (s *Server) startLocked(country string) error {
 	if _, err := os.Stat(authState); err != nil {
 		return fmt.Errorf("找不到 auth_state: %s\n%s", authState, authStateHint())
 	}
-	if portBusy(proxyPort) {
-		s.note("[urnetd] 端口 " + strconv.Itoa(proxyPort) + " 被占用，尝试清理旧进程")
-		s.killExternal()
-		if portBusy(proxyPort) {
-			return fmt.Errorf("端口 %d 仍被占用，请先手动停掉", proxyPort)
-		}
+	if portBusy(port) {
+		return fmt.Errorf("端口 %d 被占用，请修改端口或停止占用程序", port)
 	}
 
 	args := []string{
 		"--auth-state", authState,
-		"--addr", fmt.Sprintf("0.0.0.0:%d", proxyPort),
+		"--addr", net.JoinHostPort(env("URNET_BIND_HOST", "0.0.0.0"), strconv.Itoa(port)),
 		"--socks-user", socksUser,
 		"--socks-password", socksPassword(),
 	}
@@ -636,9 +651,14 @@ func (s *Server) startLocked(country string) error {
 
 	readyCh := make(chan struct{})
 	go s.pump(pr, readyCh)
+	exited := make(chan error, 1)
+	go func() { exited <- cmd.Wait() }()
 
 	select {
 	case <-readyCh:
+	case err := <-exited:
+		pr.Close()
+		return fmt.Errorf("代理启动失败: %v%s", err, s.tailLog(8))
 	case <-time.After(25 * time.Second):
 		stopProc(cmd, true)
 		pr.Close()
@@ -665,12 +685,14 @@ func (s *Server) startLocked(country string) error {
 	s.lastErr = ""
 	s.mu.Unlock()
 
-	saveCountry(country)
+	if !s.isolated {
+		saveCountry(country)
+	}
 	s.note("[urnetd] 已启动 " + country + "，pid " + strconv.Itoa(cmd.Process.Pid))
 
 	// 唯一的 Wait 点：进程退出后释放管道并更新状态
 	go func() {
-		cmd.Wait()
+		<-exited
 		pr.Close()
 
 		s.mu.Lock()
@@ -692,12 +714,14 @@ func (s *Server) startLocked(country string) error {
 			s.note("[urnetd] 进程意外退出，8 秒后自动重启（第 " + strconv.Itoa(crashes) + " 次）")
 			go func() {
 				time.Sleep(8 * time.Second)
+				s.opMu.Lock()
 				s.mu.Lock()
-				stillDown := !s.running && !s.busy
+				stillDown := !s.running && !s.busy && !s.retired && s.cmd == cmd
 				s.mu.Unlock()
 				if stillDown {
-					s.switchTo(country)
+					s.switchLocked(country)
 				}
+				s.opMu.Unlock()
 			}()
 		} else if unexpected {
 			s.note("[urnetd] 连续失败 3 次，停止重试")
@@ -712,7 +736,7 @@ func (s *Server) startLocked(country string) error {
 }
 
 func (s *Server) refreshExit() {
-	info, ms, err := probeExit()
+	info, ms, err := probeExit(s.proxyPort())
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err != nil {
@@ -767,6 +791,16 @@ func (s *Server) Switch(country string) {
 func (s *Server) switchTo(country string) {
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
+	s.switchLocked(country)
+}
+
+func (s *Server) switchLocked(country string) {
+	s.mu.Lock()
+	retired := s.retired
+	s.mu.Unlock()
+	if retired {
+		return
+	}
 
 	s.mu.Lock()
 	s.busy = true
@@ -1326,6 +1360,7 @@ func (s *Server) handleShutdown(w http.ResponseWriter, r *http.Request) {
 	s.note("[urnetd] 收到退出请求，正在停止")
 	go func() {
 		time.Sleep(200 * time.Millisecond)
+		subscriptions.stopAll()
 		s.opMu.Lock()
 		s.stopLocked()
 		s.opMu.Unlock()
@@ -1337,9 +1372,8 @@ func (s *Server) handleShutdown(w http.ResponseWriter, r *http.Request) {
 // ---------- Clash / mihomo 订阅 ----------
 
 func yamlQuote(s string) string {
-	s = strings.ReplaceAll(s, `\`, `\\`)
-	s = strings.ReplaceAll(s, `"`, `\"`)
-	return `"` + s + `"`
+	b, _ := json.Marshal(s)
+	return string(b)
 }
 
 // clashYAML 生成只含一个节点的最小可用配置。
@@ -1380,13 +1414,44 @@ func (s *Server) clashYAML(host string) string {
 
 // handleSub 订阅地址：/sub/<token>.yaml，用令牌代替登录态
 func (s *Server) handleSub(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" && r.Method != "HEAD" {
+		w.WriteHeader(405)
+		return
+	}
 	tok := strings.TrimPrefix(r.URL.Path, "/sub/")
-	tok = strings.TrimSuffix(tok, ".yaml")
+	format := "clash"
+	if strings.HasSuffix(tok, ".conf") {
+		format = "qx"
+		tok = strings.TrimSuffix(tok, ".conf")
+	} else {
+		tok = strings.TrimSuffix(tok, ".yaml")
+	}
 	if !checkSubToken(tok) {
 		http.Error(w, "token 不对", http.StatusForbidden)
 		return
 	}
 	host := nodeHostFrom(r.URL.Query().Get("host"))
+	if !validSubscriptionHost(host) {
+		http.Error(w, "请设置有效的节点 IP 或域名", 400)
+		return
+	}
+	nodes := subscriptions.snapshot()
+	if len(nodes) > 0 || format == "qx" {
+		body, err := renderSubscription(format, host, nodes, socksUser, socksPassword())
+		if err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		if format == "clash" {
+			w.Header().Set("Content-Type", "text/yaml; charset=utf-8")
+		}
+		if r.Method != "HEAD" {
+			w.Write([]byte(body))
+		}
+		return
+	}
 	w.Header().Set("Content-Type", "text/yaml; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	// 客户端多半拿文件名当订阅名，所以带上地区
@@ -1583,6 +1648,19 @@ func serve() {
 	}
 
 	s := NewServer()
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-signals
+		subscriptions.stopAll()
+		s.opMu.Lock()
+		s.mu.Lock()
+		s.retired = true
+		s.mu.Unlock()
+		s.stopLocked()
+		s.opMu.Unlock()
+		os.Exit(0)
+	}()
 
 	if err := os.MkdirAll(filepath.Dir(confFile), 0o755); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -1626,11 +1704,11 @@ func serve() {
 	}
 	authStateBroken = authStateMissing
 
-	// 启动时若端口已被外部进程占用，先接管
-	if portBusy(proxyPort) {
-		fmt.Println("  端口已被占用，尝试接管…")
-		s.killExternal()
+	// Never kill processes by executable path: other country workers use the same binary.
+	if err := subscriptions.load(); err != nil {
+		s.note("[urnetd] 订阅配置读取失败: " + err.Error())
 	}
+	go subscriptions.reconcile(false)
 
 	go func() {
 		time.Sleep(300 * time.Millisecond)
@@ -1663,6 +1741,7 @@ func serve() {
 		var last time.Time
 		if st, err := os.Stat(authState); err == nil {
 			last = st.ModTime()
+			go subscriptions.reconcile(true)
 		}
 		for range time.Tick(30 * time.Second) {
 			st, err := os.Stat(authState)
@@ -1739,6 +1818,7 @@ func serve() {
 	mux.HandleFunc("/api/push-flclash", s.authWrap(s.handlePushFlClash))
 	// 订阅地址用令牌鉴权，Clash 拉取时没有登录态
 	mux.HandleFunc("/sub/", s.handleSub)
+	mux.HandleFunc("/api/subscriptions", s.authWrap(s.handleSubscriptions))
 	mux.HandleFunc("/api/logs", s.authWrap(s.handleLogs))
 	mux.HandleFunc("/api/shutdown", s.authWrap(s.handleShutdown))
 	mux.HandleFunc("/api/host", s.authWrap(s.handlePublicHost))
@@ -2038,6 +2118,19 @@ details.howto img{display:block;width:100%;max-width:290px;border-radius:10px;
     </section>
 
     <section class="view" id="view-node">
+      <div class="card">
+        <div class="hd"><span>多国家订阅</span></div>
+        <p class="muted">选择需要的国家，保存后在客户端更新订阅。每个国家使用独立端口；建议先选 2–3 个，最多 8 个。</p>
+        <div id="sub-countries" class="row" style="flex-wrap:wrap;margin:12px 0"></div>
+        <div class="row"><button class="btn p" id="sub-save">保存国家并启动</button><button class="btn" id="sub-reload">刷新状态</button></div>
+        <p id="sub-status" class="muted" style="white-space:pre-wrap"></p>
+        <div class="field"><label>节点地址（IP 或域名，不带端口；手机访问时不能填 127.0.0.1）</label><input id="sub-host" placeholder="服务器 IPv6 / 域名 / 局域网 IP"></div>
+        <div class="field"><label>订阅服务地址（填写手机和电脑能够访问的面板地址）</label><input id="sub-base" placeholder="https://panel.example.com"></div>
+        <div class="field"><label>Clash Verge 订阅链接</label><input id="sub-clash" readonly><div class="row"><button class="btn" id="sub-copy-clash">复制 Clash 链接</button><button class="btn" id="sub-import-clash">导入本机 Clash Verge</button></div></div>
+        <div class="field"><label>Quantumult X 节点资源链接</label><input id="sub-qx" readonly><button class="btn" id="sub-copy-qx">复制 Quantumult X 链接</button></div>
+        <p class="muted">Quantumult X：设置 → 节点 → 引用，添加上面的资源链接。链接含访问令牌，请勿分享；修改面板密码会让旧链接失效。SOCKS5 连接未加密，远程访问建议通过 VPN 或安全隧道。</p>
+        <div id="sub-error" class="err"></div>
+      </div>
       <div class="grid g2">
         <div class="card">
           <div class="hd"><span>节点</span></div>
@@ -2132,6 +2225,31 @@ details.howto img{display:block;width:100%;max-width:290px;border-radius:10px;
 </div>
 <script>
 var S=null, HOST='', REG=[], lastNodeKey='';
+var SUB=null, subSelected=[], subDirty=false;
+function paintSubCountries(){
+  var names=REG.map(function(r){return r.name});
+  subSelected.forEach(function(c){if(names.indexOf(c)<0) names.push(c)});
+  setHTML('sub-countries',names.map(function(c){return '<label class="chk"><input type="checkbox" value="'+esc(c)+'" '+(subSelected.indexOf(c)>=0?'checked':'')+'><span>'+esc(c)+'</span></label>'}).join('')||'<span class="muted">登录 URnetwork 后刷新地区列表</span>');
+}
+function updateSubLinks(){
+  if(!SUB) return;
+  try{
+    var base=new URL($('sub-base').value);
+    if(!/^https?:$/.test(base.protocol)||base.username||base.password||base.search||base.hash||base.pathname!=='/') throw new Error('订阅服务地址应为 http(s)://域名:端口，不含路径');
+    ['clash','qx'].forEach(function(f){var u=new URL(SUB[f+'Path'],base.origin);u.searchParams.set('host',$('sub-host').value.trim());$('sub-'+f).value=u.href});
+    setText('sub-error','');
+  }catch(e){$('sub-clash').value='';$('sub-qx').value='';setText('sub-error',e.message)}
+}
+async function loadSubscriptions(){
+  try{
+    SUB=await get('/api/subscriptions');if(SUB.error) throw new Error(SUB.error);
+    if(!subDirty){subSelected=SUB.nodes.map(function(n){return n.country});paintSubCountries()}
+    if(!$('sub-base').value) $('sub-base').value=location.origin;
+    if(!$('sub-host').value) $('sub-host').value=HOST||location.hostname.replace(/^\[|\]$/g,'');
+    setText('sub-status',SUB.nodes.map(function(n){return n.country+' · '+n.port+' · '+(n.busy?'启动中':n.running?'运行中':'未运行')+(n.exitIP?' · 出口 '+n.exitIP:'')+(n.error?' · '+n.error:'')}).join('\n')||'尚未选择订阅国家');
+    updateSubLinks();
+  }catch(e){setText('sub-error',e.message)}
+}
 function $(id){return document.getElementById(id)}
 function setText(id,v){var e=$(id); if(e) e.textContent=v}
 function setHTML(id,v){var e=$(id); if(e) e.innerHTML=v}
@@ -2149,7 +2267,7 @@ function showView(v){
   for(i=0;i<ns.length;i++) ns[i].classList.toggle('on', ns[i].getAttribute('data-view')===v);
   setText('page-title', TITLES[v]||'仪表盘');
   try{ localStorage.setItem('urnetdView', v); }catch(e){}
-  if(v==='node'){ lastNodeKey=''; paintNode(); }
+  if(v==='node'){ lastNodeKey=''; paintNode(); loadSubscriptions(); }
   if(v==='dash'){ paintQuick(); }
 }
 
@@ -2253,7 +2371,7 @@ function paintRegions(){
 }
 
 async function loadRegions(force){
-  try{ REG=await get('/api/regions'+(force?'?refresh=1':'')); paintRegions(); }catch(e){}
+  try{ var regions=await get('/api/regions'+(force?'?refresh=1':'')); if(Array.isArray(regions)) REG=regions; paintRegions(); paintSubCountries(); }catch(e){}
 }
 
 async function poll(){
@@ -2308,6 +2426,25 @@ function bindPush(id, endpoint, label, confirmText){
 }
 
 function on(id, ev, fn){ var e=$(id); if(e) e.addEventListener(ev, fn); }
+
+on('sub-countries','change',function(){subDirty=true;subSelected=Array.from(this.querySelectorAll('input:checked')).map(function(e){return e.value})});
+on('sub-host','input',updateSubLinks);
+on('sub-base','input',updateSubLinks);
+on('sub-reload','click',loadSubscriptions);
+on('sub-save','click',async function(){
+  this.disabled=true;setText('sub-error','');
+  try{var r=await post('/api/subscriptions',{countries:subSelected});if(r.error) throw new Error(r.error);subDirty=false;await loadSubscriptions()}
+  catch(e){setText('sub-error',e.message)}finally{this.disabled=false}
+});
+async function copySubscription(format){
+  var input=$('sub-'+format);if(!input.value) return;
+  try{if(!navigator.clipboard) throw new Error('clipboard unavailable');await navigator.clipboard.writeText(input.value);setText('sub-error','链接已复制')}
+  catch(e){input.focus();input.select();setText('sub-error','请复制已选中的链接（HTTP 页面可能不允许自动复制）')}
+}
+on('sub-copy-clash','click',function(){copySubscription('clash')});
+on('sub-copy-qx','click',function(){copySubscription('qx')});
+on('sub-import-clash','click',function(){if($('sub-clash').value) location.href='clash://install-config?url='+encodeURIComponent($('sub-clash').value)+'&name=URnetwork'});
+setInterval(function(){if($('view-node').classList.contains('on')) loadSubscriptions()},5000);
 
 on('regions','click',function(e){
   var n=e.target.closest('.ritem');

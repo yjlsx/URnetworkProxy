@@ -16,6 +16,8 @@ urnetd.json
 *.bak
 *.json.tmp
 .auth_state
+/subscriptions.json
+/subscriptions.json.tmp
 
 # 个人截图（含内网 IP、账号名）
 /panel-*.png

@@ -285,6 +285,10 @@ func subToken() string {
 }
 
 func checkSubToken(t string) bool {
+	c := loadConf()
+	if c.PassHash == "" || c.Salt == "" {
+		return false
+	}
 	return subtle.ConstantTimeCompare([]byte(t), []byte(subToken())) == 1
 }
 

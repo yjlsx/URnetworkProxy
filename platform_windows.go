@@ -27,6 +27,9 @@ func openURL(u string) error {
 // 排除虚拟网卡：Hyper-V、VMware、VirtualBox、各类 TUN
 func ignoreIface(name string) bool {
 	lower := strings.ToLower(name)
+	if lower == "lo" {
+		return true
+	}
 	for _, p := range []string{"vethernet", "loopback", "tun", "tap", "wg", "tailscale",
 		"vmware", "virtualbox", "npcap", "docker", "br-", "zerotier"} {
 		if strings.HasPrefix(lower, p) {
