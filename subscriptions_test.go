@@ -212,6 +212,17 @@ func TestCountryWorkersIndependentAndRetired(t *testing.T) {
 
 func TestSubscriptionStatusDoesNotLeakPassword(t *testing.T) {
 	testSubscriptionConfig(t)
+	t.Setenv("URNET_PUBLIC_HOST", "proxy.example.com")
+	t.Setenv("URNET_BIND_HOST", "127.0.0.1")
+	old := subscriptions
+	worker := NewServer()
+	worker.running = true
+	worker.probeErr = "upstream timed out"
+	subscriptions = &subscriptionManager{
+		nodes:   []subscriptionNode{{"Japan", 10000}},
+		workers: map[string]*Server{"Japan": worker},
+	}
+	t.Cleanup(func() { subscriptions = old })
 	rr := httptest.NewRecorder()
 	NewServer().handleSubscriptions(rr, httptest.NewRequest("GET", "/api/subscriptions", nil))
 	var result map[string]any
@@ -220,5 +231,12 @@ func TestSubscriptionStatusDoesNotLeakPassword(t *testing.T) {
 	}
 	if strings.Contains(rr.Body.String(), "test-password") {
 		t.Fatal("password leaked")
+	}
+	if result["nodeHost"] != "proxy.example.com" || result["bindHost"] != "127.0.0.1" {
+		t.Fatal("missing configured connection addresses")
+	}
+	node := result["nodes"].([]any)[0].(map[string]any)
+	if node["running"] != true || node["probeError"] != "upstream timed out" || node["exitIP"] != "" {
+		t.Fatal("process status must preserve failed upstream probe")
 	}
 }

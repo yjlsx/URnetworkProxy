@@ -289,17 +289,19 @@ func (s *Server) handleSubscriptions(w http.ResponseWriter, r *http.Request) {
 	states := make([]map[string]any, 0, len(nodes))
 	subscriptions.mu.Lock()
 	for _, n := range nodes {
-		state := map[string]any{"country": n.Country, "port": n.Port, "running": false, "error": "", "exitIP": ""}
+		state := map[string]any{"country": n.Country, "port": n.Port, "running": false, "busy": false, "error": "", "probeError": "", "exitIP": "", "latencyMs": int64(0)}
 		if worker := subscriptions.workers[n.Country]; worker != nil {
 			worker.mu.Lock()
 			state["running"] = worker.running
 			state["busy"] = worker.busy
 			state["error"] = worker.lastErr
 			state["exitIP"] = worker.exitIP
+			state["probeError"] = worker.probeErr
+			state["latencyMs"] = worker.latency
 			worker.mu.Unlock()
 		}
 		states = append(states, state)
 	}
 	subscriptions.mu.Unlock()
-	json.NewEncoder(w).Encode(map[string]any{"nodes": states, "maxCountries": maxSubscriptionCountries, "clashPath": "/sub/" + subToken() + ".yaml", "qxPath": "/sub/" + subToken() + ".conf"})
+	json.NewEncoder(w).Encode(map[string]any{"nodes": states, "nodeHost": nodeHostFrom(""), "bindHost": env("URNET_BIND_HOST", "0.0.0.0"), "maxCountries": maxSubscriptionCountries, "clashPath": "/sub/" + subToken() + ".yaml", "qxPath": "/sub/" + subToken() + ".conf"})
 }

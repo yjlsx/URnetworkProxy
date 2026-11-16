@@ -2115,22 +2115,22 @@ details.howto img{display:block;width:100%;max-width:290px;border-radius:10px;
         </div>
         <div class="rlist" id="regions"></div>
       </div>
-    </section>
-
-    <section class="view" id="view-node">
       <div class="card">
         <div class="hd"><span>多国家订阅</span></div>
         <p class="muted">选择需要的国家，保存后在客户端更新订阅。每个国家使用独立端口；建议先选 2–3 个，最多 8 个。</p>
         <div id="sub-countries" class="row" style="flex-wrap:wrap;margin:12px 0"></div>
-        <div class="row"><button class="btn p" id="sub-save">保存国家并启动</button><button class="btn" id="sub-reload">刷新状态</button></div>
+        <div class="row"><button class="btn p" id="sub-save">保存订阅国家并启动</button><button class="btn" id="sub-reload">刷新状态</button></div>
         <p id="sub-status" class="muted" style="white-space:pre-wrap"></p>
-        <div class="field"><label>节点地址（IP 或域名，不带端口；手机访问时不能填 127.0.0.1）</label><input id="sub-host" placeholder="服务器 IPv6 / 域名 / 局域网 IP"></div>
+        <div class="field"><label for="sub-host">节点直连地址（服务器 IP 或直连域名，不带端口）</label><div class="row"><input id="sub-host" placeholder="服务器公网 IP / 仅 DNS 域名 / VPN 地址"><button class="btn" id="sub-save-host">保存节点地址</button></div><p id="sub-host-hint" class="muted" style="white-space:pre-wrap"></p></div>
         <div class="field"><label>订阅服务地址（填写手机和电脑能够访问的面板地址）</label><input id="sub-base" placeholder="https://panel.example.com"></div>
         <div class="field"><label>Clash Verge 订阅链接</label><input id="sub-clash" readonly><div class="row"><button class="btn" id="sub-copy-clash">复制 Clash 链接</button><button class="btn" id="sub-import-clash">导入本机 Clash Verge</button></div></div>
         <div class="field"><label>Quantumult X 节点资源链接</label><input id="sub-qx" readonly><button class="btn" id="sub-copy-qx">复制 Quantumult X 链接</button></div>
         <p class="muted">Quantumult X：设置 → 节点 → 引用，添加上面的资源链接。链接含访问令牌，请勿分享；修改面板密码会让旧链接失效。SOCKS5 连接未加密，远程访问建议通过 VPN 或安全隧道。</p>
         <div id="sub-error" class="err"></div>
       </div>
+    </section>
+
+    <section class="view" id="view-node">
       <div class="grid g2">
         <div class="card">
           <div class="hd"><span>节点</span></div>
@@ -2225,7 +2225,7 @@ details.howto img{display:block;width:100%;max-width:290px;border-radius:10px;
 </div>
 <script>
 var S=null, HOST='', REG=[], lastNodeKey='';
-var SUB=null, subSelected=[], subDirty=false;
+var SUB=null, subSelected=[], subDirty=false, subHostDirty=false;
 function paintSubCountries(){
   var names=REG.map(function(r){return r.name});
   subSelected.forEach(function(c){if(names.indexOf(c)<0) names.push(c)});
@@ -2236,7 +2236,18 @@ function updateSubLinks(){
   try{
     var base=new URL($('sub-base').value);
     if(!/^https?:$/.test(base.protocol)||base.username||base.password||base.search||base.hash||base.pathname!=='/') throw new Error('订阅服务地址应为 http(s)://域名:端口，不含路径');
-    ['clash','qx'].forEach(function(f){var u=new URL(SUB[f+'Path'],base.origin);u.searchParams.set('host',$('sub-host').value.trim());$('sub-'+f).value=u.href});
+    var host=$('sub-host').value.trim();
+    if(!host || host==='auto' || /[\s/?#@,]/.test(host)) throw new Error('请填写不带协议、端口和路径的节点 IP 或直连域名');
+    var parsed=new URL('http://'+(host.indexOf(':')>=0?'['+host+']':host));
+    if(parsed.port || parsed.pathname!=='/') throw new Error('节点地址不能带端口或路径');
+    var hints=['客户端需要直连 TCP 端口：'+SUB.nodes.map(function(n){return n.port}).join('、')+'。请确认 Docker 端口映射、服务器防火墙和云安全组均已放行。'];
+    if(host===base.hostname.replace(/^\[|\]$/g,'')) hints.push('节点与面板使用同一域名：如果面板经过 Cloudflare 橙云或 Tunnel，普通网页代理无法转发 SOCKS5；请使用服务器公网 IP 或仅 DNS 的独立节点域名。');
+    if(host.indexOf(':')>=0) hints.push('这是 IPv6 地址，手机当前网络必须能够访问 IPv6。');
+    if(host==='localhost'||host==='::1'||/^127\./.test(host)) hints.push('这是回环地址，手机会连接手机自身；远程客户端无法使用。');
+    if(/^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)/.test(host)) hints.push('这是内网地址，手机需要处于可访问该地址的局域网或 VPN；Docker 容器地址不能直接作为公网入口。');
+    if(SUB.bindHost==='127.0.0.1'||SUB.bindHost==='::1') hints.push('代理只监听服务器回环地址，外部客户端无法直接连接。');
+    setText('sub-host-hint',hints.join('\n'));
+    ['clash','qx'].forEach(function(f){var u=new URL(SUB[f+'Path'],base.origin);u.searchParams.set('host',host);$('sub-'+f).value=u.href});
     setText('sub-error','');
   }catch(e){$('sub-clash').value='';$('sub-qx').value='';setText('sub-error',e.message)}
 }
@@ -2245,8 +2256,8 @@ async function loadSubscriptions(){
     SUB=await get('/api/subscriptions');if(SUB.error) throw new Error(SUB.error);
     if(!subDirty){subSelected=SUB.nodes.map(function(n){return n.country});paintSubCountries()}
     if(!$('sub-base').value) $('sub-base').value=location.origin;
-    if(!$('sub-host').value) $('sub-host').value=HOST||location.hostname.replace(/^\[|\]$/g,'');
-    setText('sub-status',SUB.nodes.map(function(n){return n.country+' · '+n.port+' · '+(n.busy?'启动中':n.running?'运行中':'未运行')+(n.exitIP?' · 出口 '+n.exitIP:'')+(n.error?' · '+n.error:'')}).join('\n')||'尚未选择订阅国家');
+    if(!subHostDirty) $('sub-host').value=SUB.nodeHost||'';
+    setText('sub-status',SUB.nodes.map(function(n){return n.country+' · '+n.port+' · '+(n.busy?'启动中':!n.running?'未运行':n.probeError?'进程运行，出口探测失败':n.exitIP?'服务器出口已验证':'进程运行，等待出口验证')+(n.exitIP?' · 出口 '+n.exitIP:'')+(n.latencyMs?' · 探测 '+n.latencyMs+' ms':'')+(n.error?' · '+n.error:'')+(n.probeError?' · '+n.probeError:'')}).join('\n')||'尚未选择订阅国家');
     updateSubLinks();
   }catch(e){setText('sub-error',e.message)}
 }
@@ -2267,7 +2278,8 @@ function showView(v){
   for(i=0;i<ns.length;i++) ns[i].classList.toggle('on', ns[i].getAttribute('data-view')===v);
   setText('page-title', TITLES[v]||'仪表盘');
   try{ localStorage.setItem('urnetdView', v); }catch(e){}
-  if(v==='node'){ lastNodeKey=''; paintNode(); loadSubscriptions(); }
+  if(v==='node'){ lastNodeKey=''; paintNode(); }
+  if(v==='regions'){ loadSubscriptions(); }
   if(v==='dash'){ paintQuick(); }
 }
 
@@ -2428,7 +2440,17 @@ function bindPush(id, endpoint, label, confirmText){
 function on(id, ev, fn){ var e=$(id); if(e) e.addEventListener(ev, fn); }
 
 on('sub-countries','change',function(){subDirty=true;subSelected=Array.from(this.querySelectorAll('input:checked')).map(function(e){return e.value})});
-on('sub-host','input',updateSubLinks);
+on('sub-host','input',function(){subHostDirty=true;updateSubLinks()});
+on('sub-save-host','click',async function(){
+  var b=this;b.disabled=true;
+  try{
+    updateSubLinks();if(!$('sub-qx').value) return;
+    var host=$('sub-host').value.trim(),r=await post('/api/host',{host:host});
+    if(r.error) throw new Error(r.error);
+    if(r.effective!==host) throw new Error('保存的地址未生效：请检查服务器 URNET_PUBLIC_HOST 环境变量是否覆盖了面板设置');
+    subHostDirty=false;HOST='';lastNodeKey='';await poll();await loadSubscriptions();setText('sub-error','节点地址已保存，请在客户端更新订阅');
+  }catch(e){setText('sub-error',e.message)}finally{b.disabled=false}
+});
 on('sub-base','input',updateSubLinks);
 on('sub-reload','click',loadSubscriptions);
 on('sub-save','click',async function(){
@@ -2444,7 +2466,7 @@ async function copySubscription(format){
 on('sub-copy-clash','click',function(){copySubscription('clash')});
 on('sub-copy-qx','click',function(){copySubscription('qx')});
 on('sub-import-clash','click',function(){if($('sub-clash').value) location.href='clash://install-config?url='+encodeURIComponent($('sub-clash').value)+'&name=URnetwork'});
-setInterval(function(){if($('view-node').classList.contains('on')) loadSubscriptions()},5000);
+setInterval(function(){if($('view-regions').classList.contains('on')) loadSubscriptions()},5000);
 
 on('regions','click',function(e){
   var n=e.target.closest('.ritem');
