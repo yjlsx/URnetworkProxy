@@ -1963,6 +1963,7 @@ input::placeholder{color:var(--dim)}
   cursor:pointer;font-size:13px}
 .ritem:hover{background:rgba(255,255,255,.05)}
 .ritem.on{background:rgba(59,130,246,.16);color:#bcd7ff}
+.ritem input{flex:0 0 auto;width:15px;height:15px;margin:0;accent-color:var(--accent)}
 .ritem i{width:6px;height:6px;border-radius:50%;background:var(--dim);flex:0 0 6px}
 .ritem.on i{background:var(--accent)}
 .ritem span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -2124,20 +2125,19 @@ details.howto img{display:block;width:100%;max-width:290px;border-radius:10px;
     </section>
     <section class="view" id="view-regions">
       <div class="card">
-        <div class="hd"><span>出口地区</span><div class="right"><span class="muted" id="region-count"></span></div></div>
+        <div class="hd"><span>订阅国家地区</span><div class="right"><span class="muted" id="region-count"></span></div></div>
         <div class="row" style="margin-bottom:12px">
-          <input id="q" placeholder="搜索地区，点一下即切换">
+          <input id="q" placeholder="搜索国家地区">
           <button class="btn" id="refresh">刷新列表</button>
-          <button class="btn" id="start">启动</button>
-          <button class="btn d" id="stop">停止</button>
+          <button class="btn p" id="sub-save">保存选择并启动</button>
+          <span class="muted" id="sub-selection-count"></span>
         </div>
+        <p class="muted">点击下方地区可多选，所选国家将显示在订阅中，最多 8 个。修改后点击「保存选择并启动」。单出口切换请使用仪表盘的快捷按钮。</p>
         <div class="rlist" id="regions"></div>
       </div>
       <div class="card">
         <div class="hd"><span>多国家订阅</span></div>
-        <p class="muted">选择需要的国家，保存后在客户端更新订阅。每个国家使用独立端口；建议先选 2–3 个，最多 8 个。</p>
-        <div id="sub-countries" class="row" style="flex-wrap:wrap;margin:12px 0"></div>
-        <div class="row"><button class="btn p" id="sub-save">保存订阅国家并启动</button><button class="btn" id="sub-reload">刷新状态</button></div>
+        <div class="row"><button class="btn" id="sub-reload">刷新状态</button></div>
         <p id="sub-status" class="muted" style="white-space:pre-wrap"></p>
         <div class="field"><label for="sub-transport">连接方式</label><select id="sub-transport"><option value="wss">HTTPS 隧道（Trojan WebSocket TLS，无需公网 IP）</option><option value="direct">SOCKS5 直连（需要客户端可达的节点端口）</option></select></div>
         <div id="sub-direct" class="field"><label for="sub-host">节点直连地址（服务器 IP 或直连域名，不带端口）</label><div class="row"><input id="sub-host" placeholder="服务器公网 IP / 仅 DNS 域名 / VPN 地址"><button class="btn" id="sub-save-host">保存节点地址</button></div></div>
@@ -2146,10 +2146,9 @@ details.howto img{display:block;width:100%;max-width:290px;border-radius:10px;
         <div class="field"><label>Clash Verge 订阅链接</label><input id="sub-clash" readonly><div class="row"><button class="btn" id="sub-copy-clash">复制 Clash 链接</button><button class="btn" id="sub-import-clash">导入本机 Clash Verge</button></div></div>
         <div class="field"><label>Quantumult X 节点资源链接</label><input id="sub-qx" readonly><button class="btn" id="sub-copy-qx">复制 Quantumult X 链接</button></div>
         <div class="field">
-          <label>已启动国家的单节点链接</label>
-          <div class="row"><button class="btn" id="sub-show-links">获取已启动节点链接</button><button class="btn" id="sub-copy-nodes" disabled>复制全部节点链接</button><button class="btn" id="sub-copy-node-qx" disabled>复制全部 QX 节点配置</button></div>
-          <p class="muted">只列出已启动且未在切换的国家。可逐个复制 URI，或复制 QX 原生配置到 Quantumult X 的节点编辑中。链接包含凭据；启动状态不代表手机连通性已验证。</p>
-          <div id="sub-node-links"></div>
+          <label>批量复制已启动节点</label>
+          <div class="row"><select id="sub-copy-format" aria-label="节点复制格式"><option value="uri">Trojan 节点链接（trojan://）</option><option value="qx">Quantumult X 原生配置</option></select><button class="btn" id="sub-copy-nodes">复制全部已启动节点</button></div>
+          <p class="muted">点击后直接复制全部已启动且未在切换的国家，一行一个。Quantumult X 请选原生配置，或使用上面的 QX 订阅。格式转换不会改变代理协议；目标应用需要支持对应协议和 WebSocket TLS。链接包含凭据。</p>
           <textarea id="sub-node-copy" readonly hidden aria-label="待复制的节点链接" style="width:100%;min-height:100px"></textarea>
           <p id="sub-node-message" class="muted"></p>
         </div>
@@ -2253,24 +2252,19 @@ details.howto img{display:block;width:100%;max-width:290px;border-radius:10px;
 </div>
 <script>
 var S=null, HOST='', REG=[], lastNodeKey='';
-var SUB=null, subSelected=[], subDirty=false, subHostDirty=false, subNodeLinks=[];
+var SUB=null, subSelected=[], subDirty=false, subHostDirty=false;
 function clearSubNodeLinks(){
-  subNodeLinks=[];setHTML('sub-node-links','');$('sub-copy-nodes').disabled=true;$('sub-copy-node-qx').disabled=true;
   $('sub-node-copy').hidden=true;$('sub-node-copy').value='';setText('sub-node-message','');
 }
-async function copySubNodeText(text){
+async function copySubNodeText(text,count){
   if(!text) return;
-  try{if(!navigator.clipboard) throw new Error('clipboard unavailable');await navigator.clipboard.writeText(text);setText('sub-node-message','已复制')}
+  try{if(!navigator.clipboard) throw new Error('clipboard unavailable');await navigator.clipboard.writeText(text);setText('sub-node-message','已复制全部 '+count+' 个已启动节点')}
   catch(e){var box=$('sub-node-copy');box.hidden=false;box.value=text;box.focus();box.select();setText('sub-node-message','请手动复制已选中的内容')}
-}
-function paintSubCountries(){
-  var names=REG.map(function(r){return r.name});
-  subSelected.forEach(function(c){if(names.indexOf(c)<0) names.push(c)});
-  setHTML('sub-countries',names.map(function(c){return '<label class="chk"><input type="checkbox" value="'+esc(c)+'" '+(subSelected.indexOf(c)>=0?'checked':'')+'><span>'+esc(c)+'</span></label>'}).join('')||'<span class="muted">登录 URnetwork 后刷新地区列表</span>');
 }
 function updateSubLinks(){
   if(!SUB) return;
   var tunnel=$('sub-transport').value==='wss';
+  $('sub-copy-format').options[0].textContent=tunnel?'Trojan 节点链接（trojan://）':'SOCKS5 节点链接（socks5://）';
   $('sub-direct').style.display=tunnel?'none':'';
   try{
     var base=new URL($('sub-base').value);
@@ -2299,7 +2293,8 @@ function updateSubLinks(){
 async function loadSubscriptions(){
   try{
     SUB=await get('/api/subscriptions');if(SUB.error) throw new Error(SUB.error);
-    if(!subDirty){subSelected=SUB.nodes.map(function(n){return n.country});paintSubCountries()}
+    if(!subDirty){subSelected=SUB.nodes.map(function(n){return n.country})}
+    paintRegions();
     if(!$('sub-base').value) $('sub-base').value=location.origin;
     if(!subHostDirty) $('sub-host').value=SUB.nodeHost||'';
     setText('sub-status',SUB.nodes.map(function(n){return n.country+' · '+n.port+' · '+(n.busy?'启动中':!n.running?'未运行':n.probeError?'进程运行，出口探测失败':n.exitIP?'服务器出口已验证':'进程运行，等待出口验证')+(n.exitIP?' · 出口 '+n.exitIP:'')+(n.latencyMs?' · 探测 '+n.latencyMs+' ms':'')+(n.error?' · '+n.error:'')+(n.probeError?' · '+n.probeError:'')}).join('\n')||'尚未选择订阅国家');
@@ -2413,22 +2408,26 @@ async function paintNode(){
 function paintRegions(){
   var box=$('regions'); if(!box) return;
   var q=($('q')&&$('q').value||'').toLowerCase();
-  var cur=S?S.country:'';
   var html='';
-  if(S && S.bestSupported!==false && !q){
-    html+='<div class="ritem'+(S.best?' on':'')+'" data-n="__best__"><i></i><span>🏆 最佳可用</span><b>自动挑</b></div>';
-  }
-  for(var i=0;i<REG.length;i++){
-    var r=REG[i];
+  var regions=REG.slice();
+  subSelected.forEach(function(c){if(!regions.some(function(r){return r.name===c})) regions.push({name:c,count:'暂不可用'})});
+  for(var i=0;i<regions.length;i++){
+    var r=regions[i];
     if(q && r.name.toLowerCase().indexOf(q)<0) continue;
-    var on=(!S || !S.best) && r.name===cur;
-    html+='<div class="ritem'+(on?' on':'')+'" data-n="'+esc(r.name)+'"><i></i><span>'+esc(r.name)+'</span><b>'+r.count+'</b></div>';
+    var selected=subSelected.indexOf(r.name)>=0;
+    html+='<label class="ritem'+(selected?' on':'')+'"><input type="checkbox" data-country="'+esc(r.name)+'" '+(selected?'checked':'')+'><span>'+esc(r.name)+'</span><b>'+esc(r.count)+'</b></label>';
   }
-  box.innerHTML=html||'<div class="muted" style="padding:10px">没有匹配的地区</div>';
+  html=html||'<div class="muted" style="padding:10px">没有匹配的地区</div>';
+  if(box.dataset.rendered!==html){
+    var active=document.activeElement,country=box.contains(active)?active.getAttribute('data-country'):null;
+    box.innerHTML=html;box.dataset.rendered=html;
+    if(country) Array.from(box.querySelectorAll('input[data-country]')).some(function(input){if(input.getAttribute('data-country')===country){input.focus({preventScroll:true});return true}return false});
+  }
+  setText('sub-selection-count','已选 '+subSelected.length+' / 8'+(subDirty?' · 未保存':''));
 }
 
 async function loadRegions(force){
-  try{ var regions=await get('/api/regions'+(force?'?refresh=1':'')); if(Array.isArray(regions)) REG=regions; paintRegions(); paintSubCountries(); }catch(e){}
+  try{ var regions=await get('/api/regions'+(force?'?refresh=1':'')); if(Array.isArray(regions)) REG=regions; paintRegions(); }catch(e){}
 }
 
 async function poll(){
@@ -2484,7 +2483,6 @@ function bindPush(id, endpoint, label, confirmText){
 
 function on(id, ev, fn){ var e=$(id); if(e) e.addEventListener(ev, fn); }
 
-on('sub-countries','change',function(){subDirty=true;subSelected=Array.from(this.querySelectorAll('input:checked')).map(function(e){return e.value})});
 on('sub-host','input',function(){subHostDirty=true;clearSubNodeLinks();updateSubLinks()});
 on('sub-transport','change',function(){try{localStorage.setItem('urnetdSubTransport',this.value)}catch(e){}clearSubNodeLinks();updateSubLinks()});
 on('sub-save-host','click',async function(){
@@ -2501,8 +2499,9 @@ on('sub-base','input',function(){clearSubNodeLinks();updateSubLinks()});
 on('sub-reload','click',loadSubscriptions);
 on('sub-save','click',async function(){
   clearSubNodeLinks();
+  var saved=subSelected.slice();
   this.disabled=true;setText('sub-error','');
-  try{var r=await post('/api/subscriptions',{countries:subSelected});if(r.error) throw new Error(r.error);subDirty=false;await loadSubscriptions()}
+  try{var r=await post('/api/subscriptions',{countries:saved});if(r.error) throw new Error(r.error);subDirty=JSON.stringify(subSelected)!==JSON.stringify(saved);await loadSubscriptions()}
   catch(e){setText('sub-error',e.message)}finally{this.disabled=false}
 });
 async function copySubscription(format){
@@ -2512,28 +2511,29 @@ async function copySubscription(format){
 }
 on('sub-copy-clash','click',function(){copySubscription('clash')});
 on('sub-copy-qx','click',function(){copySubscription('qx')});
-on('sub-show-links','click',async function(){
-  var b=this;b.disabled=true;clearSubNodeLinks();
+on('sub-copy-nodes','click',async function(){
+  var b=this,kind=$('sub-copy-format').value;b.disabled=true;clearSubNodeLinks();
   try{
+    if(!SUB) await loadSubscriptions();
     updateSubLinks();if(!$('sub-qx').value) return;
     var url=new URL($('sub-qx').value),params=new URLSearchParams(url.search);
     var r=await get('/api/subscription-links?'+params.toString());if(r.error) throw new Error(r.error);
     if(!Array.isArray(r.nodes)) throw new Error('无法获取节点链接，请检查连接地址和服务器版本');
-    subNodeLinks=r.nodes;
-    setHTML('sub-node-links',subNodeLinks.map(function(n,i){return '<div class="field"><label>'+esc(n.country)+'</label><input readonly aria-label="'+esc(n.country)+' 节点链接" value="'+esc(n.uri)+'"><div class="row"><button class="btn" data-node="'+i+'" data-kind="uri">复制节点链接</button><button class="btn" data-node="'+i+'" data-kind="qx">复制 QX 配置</button></div></div>'}).join(''));
-    $('sub-copy-nodes').disabled=!subNodeLinks.length;$('sub-copy-node-qx').disabled=!subNodeLinks.length;
-    setText('sub-node-message',subNodeLinks.length?'已获取 '+subNodeLinks.length+' 个已启动节点；状态变化后请重新获取。':'暂无已启动节点，请先保存国家并等待启动完成。');
+    if(!r.nodes.length){setText('sub-node-message','暂无已启动节点，请先保存国家并等待启动完成。');return}
+    if(r.nodes.some(function(n){return typeof n[kind]!=='string'||!n[kind].trim()})) throw new Error('服务器未返回完整节点配置，请更新服务器版本后重试');
+    await copySubNodeText(r.nodes.map(function(n){return n[kind]}).join('\n'),r.nodes.length);
   }catch(e){setText('sub-node-message',e.message)}finally{b.disabled=false}
 });
-on('sub-node-links','click',function(e){var b=e.target.closest('button[data-node]');if(!b) return;var n=subNodeLinks[Number(b.getAttribute('data-node'))];if(n) copySubNodeText(n[b.getAttribute('data-kind')])});
-on('sub-copy-nodes','click',function(){copySubNodeText(subNodeLinks.map(function(n){return n.uri}).join('\n'))});
-on('sub-copy-node-qx','click',function(){copySubNodeText(subNodeLinks.map(function(n){return n.qx}).join('\n'))});
+on('sub-copy-format','change',clearSubNodeLinks);
 on('sub-import-clash','click',function(){if($('sub-clash').value) location.href='clash://install-config?url='+encodeURIComponent($('sub-clash').value)+'&name=URnetwork'});
 setInterval(function(){if($('view-regions').classList.contains('on')) loadSubscriptions()},5000);
 
-on('regions','click',function(e){
-  var n=e.target.closest('.ritem');
-  if(n && n.getAttribute('data-n')) switchTo(n.getAttribute('data-n'));
+on('regions','change',function(e){
+  var input=e.target;if(!input.matches('input[data-country]')) return;
+  var country=input.getAttribute('data-country'),i=subSelected.indexOf(country);
+  if(input.checked&&i<0){if(subSelected.length>=8){input.checked=false;setText('sub-error','最多选择 8 个国家');return}subSelected.push(country)}
+  else if(!input.checked&&i>=0) subSelected.splice(i,1);
+  subDirty=true;clearSubNodeLinks();paintRegions();
 });
 on('quick','click',function(e){
   var b=e.target.closest('button');
