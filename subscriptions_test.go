@@ -100,6 +100,10 @@ func TestSubscriptionHTTPTokenAndFormats(t *testing.T) {
 		{"/sub/invalid.yaml?host=example.com", 403, ""},
 		{"/sub/" + token + ".yaml?host=example.com", 200, "port: 10001"},
 		{"/sub/" + token + ".conf?host=2001:db8::1", 200, "socks5=[2001:db8::1]:10001"},
+		{"/sub/" + token + ".conf?transport=wss&base=https%3A%2F%2Fpanel.example.com", 200, "trojan=panel.example.com:443,"},
+		{"/sub/" + token + ".yaml?transport=wss&base=https%3A%2F%2Fpanel.example.com", 200, "network: ws"},
+		{"/sub/invalid.conf?transport=wss&base=https%3A%2F%2Fpanel.example.com", 403, ""},
+		{"/sub/" + token + ".conf?transport=wss&base=http%3A%2F%2Fpanel.example.com", 400, ""},
 		{"/sub/" + token + ".yaml?host=bad%0Ahost", 400, ""},
 	} {
 		rr := httptest.NewRecorder()

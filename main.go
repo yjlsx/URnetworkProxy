@@ -127,7 +127,7 @@ func defaultBinPath() string {
 var authStateBroken string
 
 // appVersion 打在 release notes 和 banner 里，方便确认对方跑的是哪个版本
-const appVersion = "1.1.6"
+const appVersion = "1.1.7"
 
 var (
 	binPath    = env("URNET_BIN", defaultBinPath())
@@ -1430,6 +1430,22 @@ func (s *Server) handleSub(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "token 不对", http.StatusForbidden)
 		return
 	}
+	if r.URL.Query().Get("transport") == "wss" {
+		body, err := renderTunnelSubscription(format, r.URL.Query().Get("base"), subscriptions.snapshot())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		if format == "clash" {
+			w.Header().Set("Content-Type", "text/yaml; charset=utf-8")
+		}
+		if r.Method != "HEAD" {
+			w.Write([]byte(body))
+		}
+		return
+	}
 	host := nodeHostFrom(r.URL.Query().Get("host"))
 	if !validSubscriptionHost(host) {
 		http.Error(w, "请设置有效的节点 IP 或域名", 400)
@@ -1818,6 +1834,7 @@ func serve() {
 	mux.HandleFunc("/api/push-flclash", s.authWrap(s.handlePushFlClash))
 	// 订阅地址用令牌鉴权，Clash 拉取时没有登录态
 	mux.HandleFunc("/sub/", s.handleSub)
+	mux.HandleFunc("/proxy/ws/", s.handleTunnel)
 	mux.HandleFunc("/api/subscriptions", s.authWrap(s.handleSubscriptions))
 	mux.HandleFunc("/api/logs", s.authWrap(s.handleLogs))
 	mux.HandleFunc("/api/shutdown", s.authWrap(s.handleShutdown))
@@ -2121,11 +2138,13 @@ details.howto img{display:block;width:100%;max-width:290px;border-radius:10px;
         <div id="sub-countries" class="row" style="flex-wrap:wrap;margin:12px 0"></div>
         <div class="row"><button class="btn p" id="sub-save">保存订阅国家并启动</button><button class="btn" id="sub-reload">刷新状态</button></div>
         <p id="sub-status" class="muted" style="white-space:pre-wrap"></p>
-        <div class="field"><label for="sub-host">节点直连地址（服务器 IP 或直连域名，不带端口）</label><div class="row"><input id="sub-host" placeholder="服务器公网 IP / 仅 DNS 域名 / VPN 地址"><button class="btn" id="sub-save-host">保存节点地址</button></div><p id="sub-host-hint" class="muted" style="white-space:pre-wrap"></p></div>
+        <div class="field"><label for="sub-transport">连接方式</label><select id="sub-transport"><option value="wss">HTTPS 隧道（Trojan WebSocket TLS，无需公网 IP）</option><option value="direct">SOCKS5 直连（需要客户端可达的节点端口）</option></select></div>
+        <div id="sub-direct" class="field"><label for="sub-host">节点直连地址（服务器 IP 或直连域名，不带端口）</label><div class="row"><input id="sub-host" placeholder="服务器公网 IP / 仅 DNS 域名 / VPN 地址"><button class="btn" id="sub-save-host">保存节点地址</button></div></div>
         <div class="field"><label>订阅服务地址（填写手机和电脑能够访问的面板地址）</label><input id="sub-base" placeholder="https://panel.example.com"></div>
+        <p id="sub-host-hint" class="muted" style="white-space:pre-wrap"></p>
         <div class="field"><label>Clash Verge 订阅链接</label><input id="sub-clash" readonly><div class="row"><button class="btn" id="sub-copy-clash">复制 Clash 链接</button><button class="btn" id="sub-import-clash">导入本机 Clash Verge</button></div></div>
         <div class="field"><label>Quantumult X 节点资源链接</label><input id="sub-qx" readonly><button class="btn" id="sub-copy-qx">复制 Quantumult X 链接</button></div>
-        <p class="muted">Quantumult X：设置 → 节点 → 引用，添加上面的资源链接。链接含访问令牌，请勿分享；修改面板密码会让旧链接失效。SOCKS5 连接未加密，远程访问建议通过 VPN 或安全隧道。</p>
+        <p class="muted">Quantumult X：设置 → 节点 → 引用，添加上面的资源链接。隧道模式需要新版服务器，并允许同域名 /proxy/ws/ 路径的 WebSocket 转发。链接含访问令牌，请勿分享；修改面板密码会让旧链接及隧道凭据失效。SOCKS5 直连未加密。</p>
         <div id="sub-error" class="err"></div>
       </div>
     </section>
@@ -2233,9 +2252,17 @@ function paintSubCountries(){
 }
 function updateSubLinks(){
   if(!SUB) return;
+  var tunnel=$('sub-transport').value==='wss';
+  $('sub-direct').style.display=tunnel?'none':'';
   try{
     var base=new URL($('sub-base').value);
     if(!/^https?:$/.test(base.protocol)||base.username||base.password||base.search||base.hash||base.pathname!=='/') throw new Error('订阅服务地址应为 http(s)://域名:端口，不含路径');
+    if(tunnel){
+      if(base.protocol!=='https:') throw new Error('HTTPS 隧道模式需要 https:// 订阅服务地址和有效证书');
+      setText('sub-host-hint','节点通过 '+base.host+' 的 HTTPS WebSocket 入口连接，各国家 SOCKS5 端口只需服务器内部可达。反向代理或 Cloudflare Tunnel 必须把 /proxy/ws/ 转发到本面板，并允许 WebSocket。服务器出口已验证仍需客户端测试。');
+      ['clash','qx'].forEach(function(f){var u=new URL(SUB[f+'Path'],base.origin);u.searchParams.set('transport','wss');u.searchParams.set('base',base.origin);$('sub-'+f).value=u.href});
+      setText('sub-error','');return;
+    }
     var host=$('sub-host').value.trim();
     if(!host || host==='auto' || /[\s/?#@,]/.test(host)) throw new Error('请填写不带协议、端口和路径的节点 IP 或直连域名');
     var parsed=new URL('http://'+(host.indexOf(':')>=0?'['+host+']':host));
@@ -2441,6 +2468,7 @@ function on(id, ev, fn){ var e=$(id); if(e) e.addEventListener(ev, fn); }
 
 on('sub-countries','change',function(){subDirty=true;subSelected=Array.from(this.querySelectorAll('input:checked')).map(function(e){return e.value})});
 on('sub-host','input',function(){subHostDirty=true;updateSubLinks()});
+on('sub-transport','change',function(){try{localStorage.setItem('urnetdSubTransport',this.value)}catch(e){}updateSubLinks()});
 on('sub-save-host','click',async function(){
   var b=this;b.disabled=true;
   try{
@@ -2632,6 +2660,7 @@ for(var i=0;i<navs.length;i++){
 })();
 
 (function(){
+  try{var transport=localStorage.getItem('urnetdSubTransport');if(transport==='direct'||transport==='wss') $('sub-transport').value=transport}catch(e){}
   var hideGuide=false;
   try{ hideGuide=localStorage.getItem('urnetdGuide')==='0'; }catch(e){}
   if(hideGuide && $('guide')) $('guide').style.display='none';
