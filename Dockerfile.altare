@@ -1,0 +1,35 @@
+FROM golang:1.27.3-bookworm AS build
+
+ARG SOCKSPROXY_VERSION=1.1.6
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /out/urnetd .
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl tar \
+    && curl -fsSL "https://github.com/jiema123/URnetworkProxy/releases/download/v${SOCKSPROXY_VERSION}/urnetd-linux-amd64.tar.gz" -o /tmp/upstream.tar.gz \
+    && mkdir -p /tmp/upstream \
+    && tar -xzf /tmp/upstream.tar.gz -C /tmp/upstream socksproxy \
+    && install -m 0755 /tmp/upstream/socksproxy /out/socksproxy \
+    && rm -rf /var/lib/apt/lists/* /tmp/upstream /tmp/upstream.tar.gz
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 --home-dir /data --create-home urnetd
+
+COPY --from=build --chown=10001:10001 /out/urnetd /usr/local/bin/urnetd
+COPY --from=build --chown=10001:10001 /out/socksproxy /usr/local/bin/socksproxy
+
+RUN chmod 0755 /usr/local/bin/urnetd /usr/local/bin/socksproxy
+USER 10001:10001
+WORKDIR /data
+VOLUME ["/data"]
+EXPOSE 8877
+
+CMD ["sh", "-c", "export URNETD_LISTEN=0.0.0.0:${PORT:-8877}; export URNETD_CONF=${URNETD_CONF:-/data/urnetd.json}; export URNET_AUTH_STATE=${URNET_AUTH_STATE:-/data/auth_state}; export URNET_BIND_HOST=${URNET_BIND_HOST:-127.0.0.1}; exec /usr/local/bin/urnetd"]

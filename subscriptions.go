@@ -44,7 +44,7 @@ func (s *Server) handleSubscriptionLinks(w http.ResponseWriter, r *http.Request)
 	for _, n := range nodes {
 		if worker := subscriptions.workers[n.Country]; worker != nil {
 			worker.mu.Lock()
-			active := worker.running && !worker.busy && !worker.retired
+			active := worker.running && worker.ready && !worker.busy && !worker.retired
 			worker.mu.Unlock()
 			if active {
 				running = append(running, n)
@@ -344,13 +344,17 @@ func (s *Server) handleSubscriptions(w http.ResponseWriter, r *http.Request) {
 	states := make([]map[string]any, 0, len(nodes))
 	subscriptions.mu.Lock()
 	for _, n := range nodes {
-		state := map[string]any{"country": n.Country, "port": n.Port, "running": false, "busy": false, "error": "", "probeError": "", "exitIP": "", "latencyMs": int64(0), "exitHistory": []exitObservation{}}
+		state := map[string]any{"country": n.Country, "port": n.Port, "running": false, "ready": false, "busy": false, "error": "", "probeError": "", "exitIP": "", "exitVerifiedAt": nil, "latencyMs": int64(0), "exitHistory": []exitObservation{}}
 		if worker := subscriptions.workers[n.Country]; worker != nil {
 			worker.mu.Lock()
 			state["running"] = worker.running
+			state["ready"] = worker.ready
 			state["busy"] = worker.busy
 			state["error"] = worker.lastErr
 			state["exitIP"] = worker.exitIP
+			if !worker.exitVerifiedAt.IsZero() {
+				state["exitVerifiedAt"] = worker.exitVerifiedAt
+			}
 			state["probeError"] = worker.probeErr
 			state["latencyMs"] = worker.latency
 			state["exitHistory"] = append([]exitObservation(nil), worker.exitHistory...)

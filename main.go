@@ -197,21 +197,22 @@ type Server struct {
 	isolated bool       // subscription workers must not overwrite the primary country
 	retired  bool
 
-	mu       sync.Mutex
-	cmd      *exec.Cmd
-	done     chan struct{}
-	country  string
-	running  bool
-	ready    bool
-	busy     bool
-	lastErr  string
-	pid      int
-	started  time.Time
-	exitIP   string
-	exitCity string
-	exitCC   string
-	latency  int64
-	probeErr string
+	mu             sync.Mutex
+	cmd            *exec.Cmd
+	done           chan struct{}
+	country        string
+	running        bool
+	ready          bool
+	busy           bool
+	lastErr        string
+	pid            int
+	started        time.Time
+	exitIP         string
+	exitCity       string
+	exitCC         string
+	latency        int64
+	exitVerifiedAt time.Time
+	probeErr       string
 	// exitHistory keeps a small, recent sample of the upstream exits observed
 	// through this logical node. The SOCKS port remains stable while the
 	// upstream provider/IP may change between connections.
@@ -235,6 +236,18 @@ type exitObservation struct {
 }
 
 const maxExitObservations = 4
+const defaultExitProbeInterval = 24 * time.Hour
+
+// exitProbeInterval keeps the routine probe quiet by default. Operators can
+// shorten it for diagnostics without changing the saved configuration.
+func exitProbeInterval() time.Duration {
+	if raw := strings.TrimSpace(os.Getenv("URNET_EXIT_PROBE_INTERVAL")); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d >= time.Minute {
+			return d
+		}
+	}
+	return defaultExitProbeInterval
+}
 
 func NewServer() *Server {
 	return &Server{logs: NewRing(400)}
@@ -699,6 +712,7 @@ func (s *Server) startLocked(country string) error {
 	s.ready = true
 	s.started = time.Now()
 	s.exitIP, s.exitCity, s.exitCC, s.latency = "", "", "", 0
+	s.exitVerifiedAt = time.Time{}
 	s.exitHistory = nil
 	s.lastErr = ""
 	s.mu.Unlock()
@@ -770,9 +784,10 @@ func (s *Server) refreshExit(done <-chan struct{}) {
 	s.exitCity = info.City
 	s.exitCC = info.Country
 	s.latency = ms
+	s.exitVerifiedAt = time.Now()
 	s.probeErr = ""
 	s.lastErr = ""
-	now := time.Now()
+	now := s.exitVerifiedAt
 	for i := range s.exitHistory {
 		if s.exitHistory[i].IP == info.IP {
 			s.exitHistory[i] = exitObservation{IP: info.IP, City: info.City, Country: info.Country, LatencyMs: ms, Observed: now}
@@ -791,7 +806,7 @@ func (s *Server) refreshExit(done <-chan struct{}) {
 // fixed endpoint.
 func (s *Server) refreshExitLoop(done <-chan struct{}) {
 	s.refreshExit(done)
-	t := time.NewTicker(2 * time.Minute)
+	t := time.NewTicker(exitProbeInterval())
 	defer t.Stop()
 	for {
 		select {
@@ -1000,6 +1015,9 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		"platform":      platformName(),
 		"publicHost":    loadConf().PublicHost,
 		"nodeHost":      nodeHostFrom(""),
+	}
+	if !s.exitVerifiedAt.IsZero() {
+		state["exitVerifiedAt"] = s.exitVerifiedAt
 	}
 	if !s.started.IsZero() {
 		state["uptimeSec"] = int(time.Since(s.started).Seconds())
@@ -2127,10 +2145,10 @@ details.howto img{display:block;width:100%;max-width:290px;border-radius:10px;
               <div class="big" id="s-country">—</div>
               <div class="sub" id="s-exit">当前出口 IP</div>
               <div class="row" style="margin-top:8px">
-                <label for="exit-count" class="muted">显示优选出口数</label>
+                <label for="exit-count" class="muted">显示最近出口样本数</label>
                 <select id="exit-count" aria-label="显示优选出口数"><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option></select>
               </div>
-              <div class="muted" id="s-exit-history" style="margin-top:6px">最近观测：—</div>
+          <div class="muted" id="s-exit-history" style="margin-top:6px">最近动态出口样本：—</div>
               <div style="display:flex;gap:22px;margin-top:14px">
                 <div><div class="muted" style="font-size:11px">运行时长</div><div id="s-up" style="font-size:14px">—</div></div>
                 <div><div class="muted" style="font-size:11px">端口 / PID</div><div id="s-pid" style="font-size:14px">—</div></div>
@@ -2141,7 +2159,7 @@ details.howto img{display:block;width:100%;max-width:290px;border-radius:10px;
         </div>
 
         <div class="card">
-          <div class="hd"><span>探测耗时</span></div>
+          <div class="hd"><span>最近探测耗时</span></div>
           <div class="big sm" id="s-lat">—</div>
           <div class="sub">走代理请求 ipinfo，含建连</div>
         </div>
@@ -2161,7 +2179,7 @@ details.howto img{display:block;width:100%;max-width:290px;border-radius:10px;
           <div class="muted" style="margin-top:12px">点一下即切换出口，「最佳可用」交给网络自己挑当前最好用的节点；失败会自动回滚。完整列表在「地区」页。</div>
         </div>
         <div class="card">
-          <div class="hd"><span>本地入口</span></div>
+          <div class="hd"><span>连接入口</span></div>
           <div class="kv"><span>代理端口</span><b>socks5 · 9999</b></div>
           <div class="kv"><span>面板地址</span><b id="s-panel">—</b></div>
           <div class="row" style="margin-top:10px">
@@ -2185,8 +2203,9 @@ details.howto img{display:block;width:100%;max-width:290px;border-radius:10px;
           <button class="btn p" id="sub-save">保存选择并启动</button>
           <span class="muted" id="sub-selection-count"></span>
         </div>
-        <p class="muted">点击下方地区可多选，所选国家将显示在订阅中，最多 8 个。每个国家对应一个稳定的本地代理端口，但上游出口 IP 会自动变化；页面会持续记录最近观测到的 IP。修改后点击「保存选择并启动」。</p>
+        <p class="muted">点击下方地区可多选，所选国家将显示在订阅中，最多 8 个。每个国家对应一个可连接的逻辑节点和稳定本地端口；上游出口 IP 会自动变化。页面启动时立即探测，之后默认每天探测一次并记录最多 4 个近期样本，样本不是可分别连接的独立节点。修改后点击「保存选择并启动」。</p>
         <div class="rlist" id="regions"></div>
+        <div id="region-error" class="err"></div>
       </div>
       <div class="card">
         <div class="hd"><span>多国家订阅</span></div>
@@ -2205,7 +2224,7 @@ details.howto img{display:block;width:100%;max-width:290px;border-radius:10px;
           <textarea id="sub-node-copy" readonly hidden aria-label="待复制的节点链接" style="width:100%;min-height:100px"></textarea>
           <p id="sub-node-message" class="muted"></p>
         </div>
-        <p class="muted">Quantumult X：设置 → 节点 → 引用，添加上面的资源链接。每个国家显示的是逻辑节点，真实出口 IP 由 URnetwork 自动分配并可能变化；订阅更新会带上当前运行状态和最近观测。隧道模式需要新版服务器，并允许同域名 /proxy/ws/ 路径的 WebSocket 转发。链接含访问令牌，请勿分享；修改面板密码会让旧链接及隧道凭据失效。SOCKS5 直连未加密。</p>
+        <p class="muted">Quantumult X：设置 → 节点 → 引用，添加上面的资源链接。每个国家导出的是一个逻辑节点；真实出口 IP 由 URnetwork 自动分配并可能变化，页面展示的是定期探测到的动态样本，不会为每个样本生成独立订阅节点。选择「最佳可用」时才会把出口选择交给 socksproxy 上游。隧道模式需要新版服务器，并允许同域名 /proxy/ws/ 路径的 WebSocket 转发。链接含访问令牌，请勿分享；修改面板密码会让旧链接及隧道凭据失效。SOCKS5 直连未加密。</p>
         <div id="sub-error" class="err"></div>
       </div>
     </section>
@@ -2364,15 +2383,21 @@ async function loadSubscriptions(){
     paintRegions();
     if(!$('sub-base').value) $('sub-base').value=location.origin;
     if(!subHostDirty) $('sub-host').value=SUB.nodeHost||'';
-    setText('sub-status',SUB.nodes.map(function(n){var hist=n.exitHistory||[];return n.country+' · 端口 '+n.port+' · '+(n.busy?'启动中':!n.running?'未运行':n.probeError?'进程运行，出口探测失败':n.exitIP?'当前出口已验证':'进程运行，等待出口验证')+(n.exitIP?' · 当前 '+n.exitIP:'')+(hist.length?' · 优选样本 '+exitSummary(hist):'')+(n.latencyMs?' · 最近探测 '+n.latencyMs+' ms':'')+(n.error?' · '+n.error:'')+(n.probeError?' · '+n.probeError:'')}).join('\n')||'尚未选择订阅国家');
+    setText('sub-status',SUB.nodes.map(function(n){var hist=n.exitHistory||[],at=n.exitVerifiedAt?new Date(n.exitVerifiedAt).toLocaleTimeString():'';return n.country+' · 端口 '+n.port+' · '+(n.busy?'切换中':!n.running?'未运行':!n.ready?'SOCKS 尚未就绪':n.probeError?'出口探测失败':n.exitIP?'出口已验证':'等待出口验证')+(n.exitIP?' · '+(n.probeError?'上次验证 ':'出口 ')+n.exitIP+(at?' · '+at:''):'')+(hist.length?' · 动态样本（按最近探测延迟排序） '+exitSummary(hist):'')+(n.latencyMs?' · 最近探测 '+n.latencyMs+' ms':'')+(n.error?' · '+n.error:'')+(n.probeError?' · '+n.probeError:'')}).join('\n')||'尚未选择订阅国家');
     updateSubLinks();
   }catch(e){setText('sub-error',e.message)}
 }
 function $(id){return document.getElementById(id)}
 function setText(id,v){var e=$(id); if(e) e.textContent=v}
 function setHTML(id,v){var e=$(id); if(e) e.innerHTML=v}
-async function get(u){var r=await fetch(u); if(r.status===401){location.href='/login';throw new Error('401')} return r.json()}
-async function post(u,b){var r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})}); if(r.status===401){location.href='/login';throw new Error('401')} return r.json()}
+async function parseResponse(r){
+  if(r.status===401){location.href='/login';throw new Error('401')}
+  var data=await r.json().catch(function(){return {}});
+  if(!r.ok||(data&&data.error)) throw new Error((data&&data.error)||('服务器返回 HTTP '+r.status));
+  return data;
+}
+async function get(u){return parseResponse(await fetch(u))}
+async function post(u,b){return parseResponse(await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})}))}
 function fmtUp(s){if(s==null||s<0) return '—'; var h=Math.floor(s/3600),m=Math.floor(s%3600/60); return (h?h+'h ':'')+m+'m'}
 function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
 
@@ -2409,22 +2434,24 @@ function paint(){
   if(!S) return;
   var d=$('dot'), t=$('stext');
   var online=S.running&&S.ready;
-  if(d){ d.className='dot'+(S.busy?' busy':(S.lastErr&&!S.running?' err':(online?' on':''))); }
-  setText('stext', S.busy?'切换中…':(S.lastErr&&!S.running?'异常':(online?'运行中':(S.running?'启动中…':'已停止'))));
+  var statusText=S.busy?'切换中':(S.lastErr&&!S.running?'异常':(online?'运行中':(S.running?'启动中':'已停止')));
+  var statusClass=S.busy||(!online&&S.running)?'warn':(S.lastErr&&!S.running?'err':(online?'ok':'bad'));
+  if(d){ d.className='dot'+(statusClass==='warn'?' busy':(statusClass==='err'?' err':(online?' on':''))); }
+  setText('stext', statusText);
   var cs=$('c-status');
-  if(cs){ cs.className='chip '+(S.busy?'warn':(online?'ok':'bad')); cs.textContent=S.busy?'切换中':(online?'运行中':(S.running?'启动中':'未运行')); }
+  if(cs){ cs.className='chip '+statusClass; cs.textContent=statusText; }
   setText('s-country', S.country||'—');
-  setText('s-exit', S.exitIp?('当前出口 '+S.exitIp+(S.exitCity?' · '+S.exitCity:'')):'还没有探测到出口');
+  setText('s-exit', S.exitIp?((S.probeErr?'上次验证出口 ':'当前出口 ')+S.exitIp+(S.exitCity?' · '+S.exitCity:'')+(S.exitVerifiedAt?' · '+new Date(S.exitVerifiedAt).toLocaleTimeString():'')):'还没有探测到出口');
   var history=S.exitHistory||[];
   if($('exit-count') && document.activeElement!==$('exit-count')) $('exit-count').value=String(exitDisplayCount);
   setText('s-exit-history', history.length
-    ? '近期出口样本，按探测延迟优先（自动更新；非固定节点）：'+exitSummary(history)
-    : '近期出口样本：等待探测。IP 可能随上游变化。');
+    ? '动态出口样本（默认每天更新，按探测延迟排序；不是独立节点）：'+exitSummary(history)
+    : '动态出口样本：等待首次探测。IP 可能随上游变化。');
   setText('s-up', S.uptimeSec!=null?fmtUp(S.uptimeSec):'—');
   setText('s-pid', (S.port||'—')+' / '+(S.pid||'—'));
-  setText('s-lat', S.latencyMs?S.latencyMs+' ms':'—');
+  setText('s-lat', S.probeErr?'失败':(S.latencyMs?S.latencyMs+' ms':'—'));
   setText('s-jwt', S.jwtDays>=0?S.jwtDays+' 天':'未知');
-  setText('s-panel', 'http://127.0.0.1:'+(location.port||'8877'));
+  setText('s-panel', location.origin);
   var cj=$('c-jwt');
   if(cj){ cj.className='chip '+(S.jwtDays<0?'':(S.jwtDays<7?'warn':'ok')); cj.textContent=S.jwtDays<0?'未知':(S.jwtDays<7?'即将过期':'有效'); }
   var b=$('jwtbar'); if(b){ var p=Math.max(0,Math.min(100,Math.round((S.jwtDays/30)*100))); b.style.width=(S.jwtDays<0?0:p)+'%'; }
@@ -2433,9 +2460,9 @@ function paint(){
   var push=$('push'); if(push){ push.style.display=(S.canPush===false)?'none':'inline-block'; }
   paintQuick();
   buildHosts(); paintRegions(); paintNode();
-  var bm=$('bm-status'); if(bm){ bm.className='chip '+(online?'ok':'bad'); bm.textContent=online?'运行中':'未运行'; }
+  var bm=$('bm-status'); if(bm){ bm.className='chip '+statusClass; bm.textContent=statusText; }
   setText('bm-region', S.country||'');
-  setText('bm-toggle', online?'停止':'启动');
+  var toggle=$('bm-toggle'); if(toggle){ toggle.textContent=S.running?'停止':'启动'; toggle.disabled=!!S.busy; }
   setText('region-count', S.regionCount?('共 '+S.regionCount+' 个地区'):'');
   paintAuth();
   setText('ver', S.version?('v'+S.version):'—');
@@ -2499,7 +2526,15 @@ function paintRegions(){
 }
 
 async function loadRegions(force){
-  try{ var regions=await get('/api/regions'+(force?'?refresh=1':'')); if(Array.isArray(regions)) REG=regions; paintRegions(); }catch(e){}
+  setText('region-error','');
+  try{
+    var regions=await get('/api/regions'+(force?'?refresh=1':''));
+    if(!Array.isArray(regions)) throw new Error('服务器返回的地区列表格式无效');
+    REG=regions;paintRegions();
+  }catch(e){
+    setText('region-error',REG.length?'地区列表刷新失败，当前保留上次数据：'+e.message:'地区列表加载失败：'+e.message);
+    paintRegions();
+  }
 }
 
 async function poll(){
@@ -2647,7 +2682,7 @@ on('ascopy','click',function(){
   copyText(dir, this, '打开所在文件夹');
 });
 on('orb','click',async function(){
-  if(!S) return;
+  if(!S||S.busy) return;
   if(S.running) await fetch('/api/stop',{method:'POST'});
   else await fetch('/api/start',{method:'POST'});
   poll();
@@ -2760,7 +2795,7 @@ for(var i=0;i<navs.length;i++){
     menu.classList.toggle('on');
   });
   on('bm-toggle','click',async function(){
-    if(!S) return;
+    if(!S||S.busy) return;
     if(S.running) await fetch('/api/stop',{method:'POST'});
     else await fetch('/api/start',{method:'POST'});
     poll();

@@ -221,8 +221,10 @@ func TestSubscriptionStatusDoesNotLeakPassword(t *testing.T) {
 	t.Setenv("URNET_BIND_HOST", "127.0.0.1")
 	old := subscriptions
 	worker := NewServer()
-	worker.running = true
+	worker.running, worker.ready = true, true
 	worker.probeErr = "upstream timed out"
+	worker.exitIP = "198.51.100.7"
+	worker.exitVerifiedAt = time.Date(2026, 11, 23, 8, 0, 0, 0, time.UTC)
 	subscriptions = &subscriptionManager{
 		nodes:   []subscriptionNode{{"Japan", 10000}},
 		workers: map[string]*Server{"Japan": worker},
@@ -241,7 +243,7 @@ func TestSubscriptionStatusDoesNotLeakPassword(t *testing.T) {
 		t.Fatal("missing configured connection addresses")
 	}
 	node := result["nodes"].([]any)[0].(map[string]any)
-	if node["running"] != true || node["probeError"] != "upstream timed out" || node["exitIP"] != "" {
+	if node["running"] != true || node["ready"] != true || node["probeError"] != "upstream timed out" || node["exitIP"] != "198.51.100.7" || node["exitVerifiedAt"] == nil {
 		t.Fatal("process status must preserve failed upstream probe")
 	}
 }
@@ -250,11 +252,13 @@ func TestExportRunningNodeLinks(t *testing.T) {
 	testSubscriptionConfig(t)
 	old := subscriptions
 	active, stopped, busy := NewServer(), NewServer(), NewServer()
-	active.running = true
+	active.running, active.ready = true, true
 	busy.running, busy.busy = true, true
+	unready := NewServer()
+	unready.running = true
 	subscriptions = &subscriptionManager{
-		nodes:   []subscriptionNode{{"Japan", 10000}, {"Germany", 10001}, {"Singapore", 10002}},
-		workers: map[string]*Server{"Japan": active, "Germany": stopped, "Singapore": busy},
+		nodes:   []subscriptionNode{{"Japan", 10000}, {"Germany", 10001}, {"Singapore", 10002}, {"France", 10003}},
+		workers: map[string]*Server{"Japan": active, "Germany": stopped, "Singapore": busy, "France": unready},
 	}
 	t.Cleanup(func() { subscriptions = old })
 	for _, query := range []string{"transport=wss&base=https%3A%2F%2Fpanel.example.com", "host=2001:db8::1"} {
