@@ -217,7 +217,7 @@ type Server struct {
 	// upstream provider/IP may change between connections.
 	exitHistory []exitObservation
 	probeDone   chan struct{}
-	crashes  int
+	crashes     int
 
 	logs *Ring
 
@@ -688,10 +688,11 @@ func (s *Server) startLocked(country string) error {
 	}
 
 	done := make(chan struct{})
+	probeDone := make(chan struct{})
 	s.mu.Lock()
 	s.cmd = cmd
 	s.done = done
-	s.probeDone = make(chan struct{})
+	s.probeDone = probeDone
 	s.pid = cmd.Process.Pid
 	s.country = country
 	s.running = true
@@ -748,14 +749,17 @@ func (s *Server) startLocked(country string) error {
 		}
 	}()
 
-	go s.refreshExitLoop(s.probeDone)
+	go s.refreshExitLoop(probeDone)
 	return nil
 }
 
-func (s *Server) refreshExit() {
+func (s *Server) refreshExit(done <-chan struct{}) {
 	info, ms, err := probeExit(s.proxyPort())
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.running || s.probeDone != done {
+		return
+	}
 	if err != nil {
 		// 探测失败只是暂时现象（建连中、切换中），不写进 lastErr，
 		// 否则界面上会一直挂着一条已经过期的错误。
@@ -786,7 +790,7 @@ func (s *Server) refreshExit() {
 // the worker is alive and expose the recent sample instead of claiming a
 // fixed endpoint.
 func (s *Server) refreshExitLoop(done <-chan struct{}) {
-	s.refreshExit()
+	s.refreshExit(done)
 	t := time.NewTicker(2 * time.Minute)
 	defer t.Stop()
 	for {
@@ -798,7 +802,7 @@ func (s *Server) refreshExitLoop(done <-chan struct{}) {
 			if !running {
 				return
 			}
-			s.refreshExit()
+			s.refreshExit(done)
 		case <-done:
 			return
 		}
@@ -886,8 +890,6 @@ func (s *Server) switchLocked(country string) {
 		}
 		return
 	}
-	time.Sleep(700 * time.Millisecond)
-	s.refreshExit()
 }
 
 // ---------- 地区列表 ----------
@@ -1798,18 +1800,6 @@ func serve() {
 		}
 	}()
 
-	// 每 30 秒重新探测出口 IP（出口是随机分配的，会变）
-	go func() {
-		for range time.Tick(30 * time.Second) {
-			s.mu.Lock()
-			ok := s.running && s.ready && !s.busy
-			s.mu.Unlock()
-			if ok {
-				s.refreshExit()
-			}
-		}
-	}()
-
 	// 监视凭据文件：App 刷新或命令行导入后，自动重启代理让新 token 生效
 	go func() {
 		var last time.Time
@@ -2136,6 +2126,10 @@ details.howto img{display:block;width:100%;max-width:290px;border-radius:10px;
             <div style="min-width:0;flex:1">
               <div class="big" id="s-country">—</div>
               <div class="sub" id="s-exit">当前出口 IP</div>
+              <div class="row" style="margin-top:8px">
+                <label for="exit-count" class="muted">显示优选出口数</label>
+                <select id="exit-count" aria-label="显示优选出口数"><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option></select>
+              </div>
               <div class="muted" id="s-exit-history" style="margin-top:6px">最近观测：—</div>
               <div style="display:flex;gap:22px;margin-top:14px">
                 <div><div class="muted" style="font-size:11px">运行时长</div><div id="s-up" style="font-size:14px">—</div></div>
@@ -2312,6 +2306,20 @@ details.howto img{display:block;width:100%;max-width:290px;border-radius:10px;
 <script>
 var S=null, HOST='', REG=[], lastNodeKey='';
 var SUB=null, subSelected=[], subDirty=false, subHostDirty=false;
+var exitDisplayCount=3;
+try{var storedExitCount=parseInt(localStorage.getItem('urnetdExitCount'),10);if(storedExitCount>=1&&storedExitCount<=4)exitDisplayCount=storedExitCount}catch(e){}
+function rankedExits(list){
+  return (list||[]).slice().sort(function(a,b){
+    var al=Number(a.latencyMs)||Number.MAX_SAFE_INTEGER,bl=Number(b.latencyMs)||Number.MAX_SAFE_INTEGER;
+    if(al!==bl) return al-bl;
+    return String(b.observedAt||'').localeCompare(String(a.observedAt||''));
+  });
+}
+function exitSummary(list){
+  return rankedExits(list).slice(0,exitDisplayCount).map(function(x){
+    return x.ip+(x.city?' · '+x.city:'')+(x.latencyMs?' · '+x.latencyMs+' ms':'');
+  }).join('；');
+}
 function clearSubNodeLinks(){
   $('sub-node-copy').hidden=true;$('sub-node-copy').value='';setText('sub-node-message','');
 }
@@ -2356,7 +2364,7 @@ async function loadSubscriptions(){
     paintRegions();
     if(!$('sub-base').value) $('sub-base').value=location.origin;
     if(!subHostDirty) $('sub-host').value=SUB.nodeHost||'';
-    setText('sub-status',SUB.nodes.map(function(n){var hist=n.exitHistory||[];return n.country+' · 端口 '+n.port+' · '+(n.busy?'启动中':!n.running?'未运行':n.probeError?'进程运行，出口探测失败':n.exitIP?'当前出口已验证':'进程运行，等待出口验证')+(n.exitIP?' · 当前 '+n.exitIP:'')+(hist.length?' · 最近 '+hist.map(function(x){return x.ip}).join('、'):'')+(n.latencyMs?' · 探测 '+n.latencyMs+' ms':'')+(n.error?' · '+n.error:'')+(n.probeError?' · '+n.probeError:'')}).join('\n')||'尚未选择订阅国家');
+    setText('sub-status',SUB.nodes.map(function(n){var hist=n.exitHistory||[];return n.country+' · 端口 '+n.port+' · '+(n.busy?'启动中':!n.running?'未运行':n.probeError?'进程运行，出口探测失败':n.exitIP?'当前出口已验证':'进程运行，等待出口验证')+(n.exitIP?' · 当前 '+n.exitIP:'')+(hist.length?' · 优选样本 '+exitSummary(hist):'')+(n.latencyMs?' · 最近探测 '+n.latencyMs+' ms':'')+(n.error?' · '+n.error:'')+(n.probeError?' · '+n.probeError:'')}).join('\n')||'尚未选择订阅国家');
     updateSubLinks();
   }catch(e){setText('sub-error',e.message)}
 }
@@ -2408,9 +2416,10 @@ function paint(){
   setText('s-country', S.country||'—');
   setText('s-exit', S.exitIp?('当前出口 '+S.exitIp+(S.exitCity?' · '+S.exitCity:'')):'还没有探测到出口');
   var history=S.exitHistory||[];
+  if($('exit-count') && document.activeElement!==$('exit-count')) $('exit-count').value=String(exitDisplayCount);
   setText('s-exit-history', history.length
-    ? '最近观测（自动更新）：'+history.map(function(x){return x.ip+(x.city?' · '+x.city:'')}).join('、')
-    : '最近观测：—');
+    ? '近期出口样本，按探测延迟优先（自动更新；非固定节点）：'+exitSummary(history)
+    : '近期出口样本：等待探测。IP 可能随上游变化。');
   setText('s-up', S.uptimeSec!=null?fmtUp(S.uptimeSec):'—');
   setText('s-pid', (S.port||'—')+' / '+(S.pid||'—'));
   setText('s-lat', S.latencyMs?S.latencyMs+' ms':'—');
@@ -2603,6 +2612,13 @@ on('quick','click',function(e){
   if(b && b.getAttribute('data-c')) switchTo(b.getAttribute('data-c'));
 });
 on('q','input',paintRegions);
+on('exit-count','change',function(){
+  var count=parseInt(this.value,10);
+  if(count<1||count>4) return;
+  exitDisplayCount=count;
+  try{localStorage.setItem('urnetdExitCount',String(count))}catch(e){}
+  paint();
+});
 on('refresh','click',function(){loadRegions(true)});
 on('host','change',function(){HOST=this.value;lastNodeKey='';paintNode()});
 on('copy','click',function(){ copyText($('uri').textContent, this, '复制 URI'); });
