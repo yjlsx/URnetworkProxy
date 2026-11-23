@@ -7,12 +7,13 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /out/urnetd .
+RUN mkdir -p /out \
+    && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /out/urnetd .
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl tar \
     && curl -fsSL "https://github.com/jiema123/URnetworkProxy/releases/download/v${SOCKSPROXY_VERSION}/urnetd-linux-amd64.tar.gz" -o /tmp/upstream.tar.gz \
     && mkdir -p /tmp/upstream \
-    && tar -xzf /tmp/upstream.tar.gz -C /tmp/upstream socksproxy \
+    && tar -xzf /tmp/upstream.tar.gz -C /tmp/upstream \
     && install -m 0755 /tmp/upstream/socksproxy /out/socksproxy \
     && rm -rf /var/lib/apt/lists/* /tmp/upstream /tmp/upstream.tar.gz
 
