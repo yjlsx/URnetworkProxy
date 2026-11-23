@@ -344,7 +344,7 @@ func (s *Server) handleSubscriptions(w http.ResponseWriter, r *http.Request) {
 	states := make([]map[string]any, 0, len(nodes))
 	subscriptions.mu.Lock()
 	for _, n := range nodes {
-		state := map[string]any{"country": n.Country, "port": n.Port, "running": false, "busy": false, "error": "", "probeError": "", "exitIP": "", "latencyMs": int64(0)}
+		state := map[string]any{"country": n.Country, "port": n.Port, "running": false, "busy": false, "error": "", "probeError": "", "exitIP": "", "latencyMs": int64(0), "exitHistory": []exitObservation{}}
 		if worker := subscriptions.workers[n.Country]; worker != nil {
 			worker.mu.Lock()
 			state["running"] = worker.running
@@ -353,6 +353,7 @@ func (s *Server) handleSubscriptions(w http.ResponseWriter, r *http.Request) {
 			state["exitIP"] = worker.exitIP
 			state["probeError"] = worker.probeErr
 			state["latencyMs"] = worker.latency
+			state["exitHistory"] = append([]exitObservation(nil), worker.exitHistory...)
 			worker.mu.Unlock()
 		}
 		states = append(states, state)

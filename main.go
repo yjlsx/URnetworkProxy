@@ -212,6 +212,11 @@ type Server struct {
 	exitCC   string
 	latency  int64
 	probeErr string
+	// exitHistory keeps a small, recent sample of the upstream exits observed
+	// through this logical node. The SOCKS port remains stable while the
+	// upstream provider/IP may change between connections.
+	exitHistory []exitObservation
+	probeDone   chan struct{}
 	crashes  int
 
 	logs *Ring
@@ -220,6 +225,16 @@ type Server struct {
 	regions   []Region
 	regionsAt time.Time
 }
+
+type exitObservation struct {
+	IP        string    `json:"ip"`
+	City      string    `json:"city,omitempty"`
+	Country   string    `json:"country,omitempty"`
+	LatencyMs int64     `json:"latencyMs,omitempty"`
+	Observed  time.Time `json:"observedAt"`
+}
+
+const maxExitObservations = 4
 
 func NewServer() *Server {
 	return &Server{logs: NewRing(400)}
@@ -676,12 +691,14 @@ func (s *Server) startLocked(country string) error {
 	s.mu.Lock()
 	s.cmd = cmd
 	s.done = done
+	s.probeDone = make(chan struct{})
 	s.pid = cmd.Process.Pid
 	s.country = country
 	s.running = true
 	s.ready = true
 	s.started = time.Now()
 	s.exitIP, s.exitCity, s.exitCC, s.latency = "", "", "", 0
+	s.exitHistory = nil
 	s.lastErr = ""
 	s.mu.Unlock()
 
@@ -731,7 +748,7 @@ func (s *Server) startLocked(country string) error {
 		}
 	}()
 
-	go s.refreshExit()
+	go s.refreshExitLoop(s.probeDone)
 	return nil
 }
 
@@ -751,17 +768,57 @@ func (s *Server) refreshExit() {
 	s.latency = ms
 	s.probeErr = ""
 	s.lastErr = ""
+	now := time.Now()
+	for i := range s.exitHistory {
+		if s.exitHistory[i].IP == info.IP {
+			s.exitHistory[i] = exitObservation{IP: info.IP, City: info.City, Country: info.Country, LatencyMs: ms, Observed: now}
+			return
+		}
+	}
+	s.exitHistory = append([]exitObservation{{IP: info.IP, City: info.City, Country: info.Country, LatencyMs: ms, Observed: now}}, s.exitHistory...)
+	if len(s.exitHistory) > maxExitObservations {
+		s.exitHistory = s.exitHistory[:maxExitObservations]
+	}
+}
+
+// Keep the UI honest about dynamic upstream exits. One logical country node
+// can observe several provider IPs over time, so refresh periodically while
+// the worker is alive and expose the recent sample instead of claiming a
+// fixed endpoint.
+func (s *Server) refreshExitLoop(done <-chan struct{}) {
+	s.refreshExit()
+	t := time.NewTicker(2 * time.Minute)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			s.mu.Lock()
+			running := s.running && !s.retired && s.probeDone == done
+			s.mu.Unlock()
+			if !running {
+				return
+			}
+			s.refreshExit()
+		case <-done:
+			return
+		}
+	}
 }
 
 func (s *Server) stopLocked() {
 	s.mu.Lock()
 	cmd := s.cmd
 	done := s.done
+	probeDone := s.probeDone
 	s.cmd = nil
 	s.done = nil
+	s.probeDone = nil
 	s.running = false
 	s.ready = false
 	s.mu.Unlock()
+	if probeDone != nil {
+		close(probeDone)
+	}
 	if cmd == nil || cmd.Process == nil {
 		return
 	}
@@ -931,6 +988,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		"exitCity":      s.exitCity,
 		"exitCC":        s.exitCC,
 		"latencyMs":     s.latency,
+		"exitHistory":   append([]exitObservation(nil), s.exitHistory...),
 		"lastErr":       s.lastErr,
 		"probeErr":      s.probeErr,
 		"primary":       primary,
@@ -2077,7 +2135,8 @@ details.howto img{display:block;width:100%;max-width:290px;border-radius:10px;
           <div style="display:flex;align-items:center;gap:18px">
             <div style="min-width:0;flex:1">
               <div class="big" id="s-country">—</div>
-              <div class="sub" id="s-exit">出口 IP</div>
+              <div class="sub" id="s-exit">当前出口 IP</div>
+              <div class="muted" id="s-exit-history" style="margin-top:6px">最近观测：—</div>
               <div style="display:flex;gap:22px;margin-top:14px">
                 <div><div class="muted" style="font-size:11px">运行时长</div><div id="s-up" style="font-size:14px">—</div></div>
                 <div><div class="muted" style="font-size:11px">端口 / PID</div><div id="s-pid" style="font-size:14px">—</div></div>
@@ -2132,7 +2191,7 @@ details.howto img{display:block;width:100%;max-width:290px;border-radius:10px;
           <button class="btn p" id="sub-save">保存选择并启动</button>
           <span class="muted" id="sub-selection-count"></span>
         </div>
-        <p class="muted">点击下方地区可多选，所选国家将显示在订阅中，最多 8 个。修改后点击「保存选择并启动」。单出口切换请使用仪表盘的快捷按钮。</p>
+        <p class="muted">点击下方地区可多选，所选国家将显示在订阅中，最多 8 个。每个国家对应一个稳定的本地代理端口，但上游出口 IP 会自动变化；页面会持续记录最近观测到的 IP。修改后点击「保存选择并启动」。</p>
         <div class="rlist" id="regions"></div>
       </div>
       <div class="card">
@@ -2152,7 +2211,7 @@ details.howto img{display:block;width:100%;max-width:290px;border-radius:10px;
           <textarea id="sub-node-copy" readonly hidden aria-label="待复制的节点链接" style="width:100%;min-height:100px"></textarea>
           <p id="sub-node-message" class="muted"></p>
         </div>
-        <p class="muted">Quantumult X：设置 → 节点 → 引用，添加上面的资源链接。隧道模式需要新版服务器，并允许同域名 /proxy/ws/ 路径的 WebSocket 转发。链接含访问令牌，请勿分享；修改面板密码会让旧链接及隧道凭据失效。SOCKS5 直连未加密。</p>
+        <p class="muted">Quantumult X：设置 → 节点 → 引用，添加上面的资源链接。每个国家显示的是逻辑节点，真实出口 IP 由 URnetwork 自动分配并可能变化；订阅更新会带上当前运行状态和最近观测。隧道模式需要新版服务器，并允许同域名 /proxy/ws/ 路径的 WebSocket 转发。链接含访问令牌，请勿分享；修改面板密码会让旧链接及隧道凭据失效。SOCKS5 直连未加密。</p>
         <div id="sub-error" class="err"></div>
       </div>
     </section>
@@ -2297,7 +2356,7 @@ async function loadSubscriptions(){
     paintRegions();
     if(!$('sub-base').value) $('sub-base').value=location.origin;
     if(!subHostDirty) $('sub-host').value=SUB.nodeHost||'';
-    setText('sub-status',SUB.nodes.map(function(n){return n.country+' · '+n.port+' · '+(n.busy?'启动中':!n.running?'未运行':n.probeError?'进程运行，出口探测失败':n.exitIP?'服务器出口已验证':'进程运行，等待出口验证')+(n.exitIP?' · 出口 '+n.exitIP:'')+(n.latencyMs?' · 探测 '+n.latencyMs+' ms':'')+(n.error?' · '+n.error:'')+(n.probeError?' · '+n.probeError:'')}).join('\n')||'尚未选择订阅国家');
+    setText('sub-status',SUB.nodes.map(function(n){var hist=n.exitHistory||[];return n.country+' · 端口 '+n.port+' · '+(n.busy?'启动中':!n.running?'未运行':n.probeError?'进程运行，出口探测失败':n.exitIP?'当前出口已验证':'进程运行，等待出口验证')+(n.exitIP?' · 当前 '+n.exitIP:'')+(hist.length?' · 最近 '+hist.map(function(x){return x.ip}).join('、'):'')+(n.latencyMs?' · 探测 '+n.latencyMs+' ms':'')+(n.error?' · '+n.error:'')+(n.probeError?' · '+n.probeError:'')}).join('\n')||'尚未选择订阅国家');
     updateSubLinks();
   }catch(e){setText('sub-error',e.message)}
 }
@@ -2347,7 +2406,11 @@ function paint(){
   var cs=$('c-status');
   if(cs){ cs.className='chip '+(S.busy?'warn':(online?'ok':'bad')); cs.textContent=S.busy?'切换中':(online?'运行中':(S.running?'启动中':'未运行')); }
   setText('s-country', S.country||'—');
-  setText('s-exit', S.exitIp?(S.exitIp+(S.exitCity?' · '+S.exitCity:'')):'还没有探测到出口');
+  setText('s-exit', S.exitIp?('当前出口 '+S.exitIp+(S.exitCity?' · '+S.exitCity:'')):'还没有探测到出口');
+  var history=S.exitHistory||[];
+  setText('s-exit-history', history.length
+    ? '最近观测（自动更新）：'+history.map(function(x){return x.ip+(x.city?' · '+x.city:'')}).join('、')
+    : '最近观测：—');
   setText('s-up', S.uptimeSec!=null?fmtUp(S.uptimeSec):'—');
   setText('s-pid', (S.port||'—')+' / '+(S.pid||'—'));
   setText('s-lat', S.latencyMs?S.latencyMs+' ms':'—');
